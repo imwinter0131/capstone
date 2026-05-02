@@ -1,0 +1,276 @@
+이메일을 아이디로 사용하며, 데이터는 PostgreSQL에 안전하게 저장(비밀번호 해싱 포함)되는 구조
+
+--------------------------------------------------------------------------------------------------------------------
+파일별 역할
+
+Backend 폴더 (FastAPI + PostgreSQL)
+이 폴더 안에는 데이터베이스와 서버 로직 관련 파일들이 들어갑니다.
+
+database.py: DB 연결 설정
+
+models.py: 데이터베이스 테이블(User) 정의
+
+main.py: 로그인/회원가입 API 로직
+
+venv/: 백엔드 전용 가상환경 폴더
+
+
+Frontend 폴더 (React)
+Vite로 리액트를 만드셨다면 src 폴더 안에 파일을 넣는 것이 규칙입니다.
+
+src/Login.jsx: 방금 만든 로그인 화면 컴포넌트
+
+src/App.jsx: (중요!) 이 파일에서 Login.jsx를 불러와서 화면에 띄워줘야 합니다.
+
+
+
+실행 프로세스
+
+1. 사용자 입력 (프론트엔드): 사용자가 리액트 화면에서 이메일과 비밀번호를 입력하고 로그인 버튼을 누릅니다.
+
+2. 데이터 전송 (프론트엔드 ➡️ 백엔드): 리액트가 입력된 정보를 안전하게 상자(JSON Body)에 담아 백엔드(FastAPI) 서버로 택배를 보냅니다.
+
+3. 계정 확인 (백엔드 ↔️ DB): 백엔드는 창고(PostgreSQL)를 뒤져서 해당 이메일로 가입된 유저가 있는지 확인합니다. (가입 기록이 없으면 여기서 입구 컷!)
+
+4. 비밀번호 검증 (백엔드): 계정이 있다면, 방금 사용자가 입력한 비밀번호에 똑같이 암호화 연산(bcrypt)을 돌려봅니다. 그 결과가 DB에 저장되어 있던 복잡한 암호문과 일치하는지 대조합니다.
+
+5. 결과 반환 및 화면 이동 (백엔드 ➡️ 프론트엔드):
+
+성공: 백엔드가 "통과!" 메시지를 보내고, 리액트는 성공 알림과 함께 다음 화면(프로젝트 리스트)으로 사용자를 이동시킵니다.
+
+실패: 비밀번호가 틀렸다면 백엔드가 에러를 보내고, 리액트는 "비밀번호가 일치하지 않습니다"라는 경고창을 띄웁니다.
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+1. 백엔드 구성 (FastAPI + PostgreSQL)
+
+# 기본 프레임워크 및 DB 통신 도구
+pip install fastapi uvicorn sqlalchemy psycopg2-binary
+
+# 비밀번호 암호화 도구 (버전 충돌 방지를 위해 bcrypt 버전 고정)
+pip install passlib bcrypt==3.2.2
+
+# 데이터 검증 도구 (이메일 형식 확인용)
+pip install "pydantic[email]"
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+2. DB 연결 설정 - backend/database.py - postgresql://postgres:0101@localhost/DLops 이 부분 주의!!!!!!!!!!!
+
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+# 본인의 PostgreSQL 비밀번호로 수정하세요.
+SQLALCHEMY_DATABASE_URL = "postgresql://postgres:0101@localhost/DLops"
+
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# DB 세션을 가져오는 함수
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+3. 유저 테이블 설계 - backend/models.py
+
+from sqlalchemy import Column, Integer, String
+from database import Base
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+4. 회원가입 및 로그인 API - backend/main.py
+
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.orm import Session
+from passlib.context import CryptContext
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+
+import models, database
+
+app = FastAPI()
+
+# 1. CORS 설정: 리액트(5173포트)에서 오는 요청을 허용
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 서버 시작 시 DB 테이블 생성
+models.Base.metadata.create_all(bind=database.engine)
+
+# 비밀번호 암호화 설정
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# 2. 데이터 형식 정의 (JSON 본문을 받기 위한 모델)
+class UserAuth(BaseModel):
+    email: EmailStr
+    password: str
+
+@app.get("/")
+def home():
+    return {"status": "DLOps Backend is running!"}
+
+# 3. 회원가입 API
+@app.post("/signup")
+def signup(user_data: UserAuth, db: Session = Depends(database.get_db)):
+    db_user = db.query(models.User).filter(models.User.email == user_data.email).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="이미 등록된 이메일입니다.")
+    
+    hashed_pw = pwd_context.hash(user_data.password)
+    new_user = models.User(email=user_data.email, hashed_password=hashed_pw)
+    
+    db.add(new_user)
+    db.commit()
+    return {"message": "회원가입이 성공적으로 완료되었습니다."}
+
+# 4. 로그인 API
+@app.post("/login")
+def login(user_data: UserAuth, db: Session = Depends(database.get_db)):
+    user = db.query(models.User).filter(models.User.email == user_data.email).first()
+    
+    if not user:
+        raise HTTPException(status_code=400, detail="등록되지 않은 이메일입니다.")
+    
+    if not pwd_context.verify(user_data.password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="비밀번호가 일치하지 않습니다.")
+    
+    return {"message": "로그인 성공", "user_id": user.id, "email": user.email}
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+5. 로그인 및 회원가입 컴포넌트 - frontend/src/Login.jsx
+
+import React, { useState } from 'react';
+
+function Login() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [isLogin, setIsLogin] = useState(true);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    const endpoint = isLogin ? '/login' : '/signup';
+    
+    try {
+      const response = await fetch(`http://localhost:8000${endpoint}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json', // JSON 형식임을 명시
+        },
+        body: JSON.stringify({ email, password }), // 데이터를 본문(Body)에 담아 전송
+      });
+      
+      const data = await response.json();
+      
+      if (response.ok) {
+        alert(data.message);
+        if (isLogin) {
+          // 로그인 성공 시 로직 (예: 프로젝트 리스트로 이동)
+          console.log("로그인 성공 유저 ID:", data.user_id);
+        }
+      } else {
+        // 백엔드에서 보낸 에러 메시지(detail) 표시
+        alert(data.detail || "오류가 발생했습니다.");
+      }
+    } catch (error) {
+      alert("서버와 연결할 수 없습니다. 백엔드 서버를 확인하세요.");
+    }
+  };
+
+  return (
+    <div style={{ maxWidth: '400px', margin: '100px auto', padding: '20px', border: '1px solid #ccc', borderRadius: '10px', textAlign: 'center' }}>
+      <h1>{isLogin ? 'DLOps 로그인' : '회원가입'}</h1>
+      <form onSubmit={handleSubmit}>
+        <div style={{ marginBottom: '15px' }}>
+          <input 
+            type="email" 
+            placeholder="이메일 주소" 
+            value={email} 
+            onChange={(e) => setEmail(e.target.value)} 
+            required
+            style={{ width: '100%', padding: '10px', boxSizing: 'border-box' }}
+          />
+        </div>
+        <div style={{ marginBottom: '15px' }}>
+          <input 
+            type="password" 
+            placeholder="비밀번호" 
+            value={password} 
+            onChange={(e) => setPassword(e.target.value)} 
+            required
+            style={{ width: '100%', padding: '10px', boxSizing: 'border-box' }}
+          />
+        </div>
+        <button type="submit" style={{ width: '100%', padding: '10px', backgroundColor: '#007bff', color: 'white', border: 'none', borderRadius: '5px', cursor: 'pointer' }}>
+          {isLogin ? 'Continue' : '가입하기'}
+        </button>
+      </form>
+      <p onClick={() => setIsLogin(!isLogin)} style={{ marginTop: '20px', color: '#007bff', cursor: 'pointer', textDecoration: 'underline' }}>
+        {isLogin ? '계정이 없으신가요? 회원가입' : '이미 계정이 있나요? 로그인'}
+      </p>
+    </div>
+  );
+}
+
+export default Login;
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+6. 리액트에서 꼭 해야할 작업 - frontend/src/App.jsx
+
+import React from 'react';
+import Login from './Login';
+
+function App() {
+  return (
+    <div className="App">
+      <Login />
+    </div>
+  );
+}
+
+export default App;
+--------------------------------------------------------------------------------------------------------------------
