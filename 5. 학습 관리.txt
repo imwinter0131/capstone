@@ -1,0 +1,382 @@
+5. 학습 관리
+
+프로젝트 안에서 YOLO 학습 작업을 생성하고, 실행하고, 중지하고, 진행률과 로그 및 결과 경로를 확인하는 기능입니다.
+
+3. 데이터셋 관리에서 업로드한 데이터셋을 선택합니다.
+4. 전처리 관리에서 만든 전처리 preset을 선택합니다.
+기본 YOLO 모델 또는 사용자가 직접 추가한 학습 모델을 선택해서 학습 작업을 실행합니다.
+
+--------------------------------------------------------------------------------------------------------------------
+기능 범위
+
+포함 기능
+
+* 프로젝트별 학습 작업 목록 조회
+* 새 학습 작업 생성
+* 학습 이름 입력
+* 설명 입력
+* 작업 유형 선택: 탐지 Detect / 분류 Classify
+* 기존 데이터셋 선택
+* 전처리 preset 선택
+* 기본 YOLO 모델 선택
+* 사용자 학습 모델 직접 추가
+* 사용자 학습 모델 선택
+* Optimizer 선택
+* Image Size 설정
+* Epochs 설정
+* Optuna Search Space 설정
+* 학습 시작
+* 학습 중지
+* 학습 상태 표시
+* 진행률 표시
+* 현재 Epoch 표시
+* 학습 로그 표시
+* 학습 결과 경로 표시
+* 학습 작업 삭제
+
+
+상태 값
+
+* READY: 생성됨
+* QUEUED: 실행 대기
+* RUNNING: 실행 중
+* STOPPING: 중지 요청됨
+* STOPPED: 중지됨
+* COMPLETED: 완료됨
+* FAILED: 실패
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+파일별 역할
+
+Backend 폴더 (FastAPI + PostgreSQL)
+
+database.py: PostgreSQL 데이터베이스 연결 설정
+
+models.py: TrainingJob, TrainingModel 테이블 정의
+
+main.py: 학습 생성, 실행, 중지, 로그 조회, 사용자 모델 추가 API
+
+venv/: 백엔드 전용 가상환경 폴더
+
+
+Frontend 폴더 (React)
+
+src/TrainingManage.jsx: 학습 생성, 실행, 중지, 로그, 결과 확인 화면
+
+src/TrainingManage.css: 학습 관리 화면 전용 다크 UI 디자인
+
+src/App.jsx: /projects/{project_id}/training 주소를 TrainingManage.jsx와 연결
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+실행 프로세스
+
+1. 학습 화면 이동
+
+데이터셋 관리 화면 또는 전처리 관리 화면에서 Training 버튼 선택
+
+/projects/{project_id}/training 주소 이동
+
+App.jsx에서 TrainingManage.jsx 표시
+
+
+2. 학습 화면 초기 로딩
+
+TrainingManage.jsx에서 다음 API 호출
+
+GET /projects/{project_id}/training-jobs?user_id={user_id}
+
+GET /projects/{project_id}/datasets?user_id={user_id}
+
+GET /projects/{project_id}/preprocessing-pipelines?user_id={user_id}
+
+GET /yolo-models?user_id={user_id}&project_id={project_id}
+
+학습 작업, 데이터셋, 전처리 preset, 기본 YOLO 모델, 사용자 추가 모델을 함께 표시합니다.
+
+
+3. 사용자 학습 모델 추가
+
+Add Model 버튼 선택
+
+입력 항목:
+
+* 모델 이름
+* 설명
+* 작업 유형
+* 모델 파일
+
+지원 파일:
+
+* .pt
+* .pth
+* .onnx
+
+POST /projects/{project_id}/training-models
+
+모델 파일은 프로젝트 저장 경로 아래 training_models 폴더에 저장됩니다.
+
+
+4. 새 학습 생성
+
+New Training 버튼 선택
+
+입력 항목:
+
+* 학습 이름
+* 설명
+* 작업 유형
+* 데이터셋
+* 전처리 preset
+* YOLO 모델
+* Optimizer
+* Image Size
+* Epochs
+* Batch Min / Batch Max
+* LR Initial Min / LR Initial Max
+* Momentum Min / Momentum Max
+
+POST /projects/{project_id}/training-jobs
+
+PostgreSQL training_jobs 테이블에 READY 상태로 저장합니다.
+
+
+5. 호환성 확인
+
+작업 유형에 따라 데이터셋 목록 필터링
+
+작업 유형에 따라 전처리 preset 목록 필터링
+
+작업 유형에 따라 학습 모델 목록 필터링
+
+백엔드에서도 데이터셋, 전처리 preset, 학습 모델의 task_type 일치 여부를 다시 확인합니다.
+
+
+6. 학습 시작
+
+Start 버튼 선택
+
+POST /projects/{project_id}/training-jobs/{job_id}/start
+
+학습 상태를 QUEUED로 변경
+
+백그라운드 스레드에서 학습 실행
+
+실행 폴더 생성:
+
+프로젝트 저장 경로 / runs / 학습명_job_id
+
+데이터셋 zip 압축 해제
+
+data.yaml 탐색
+
+ultralytics 패키지가 있으면 YOLO 학습 프로세스 실행
+
+ultralytics 패키지가 없거나 data.yaml이 없으면 개발 환경 시뮬레이션으로 진행률과 로그 생성
+
+
+7. 학습 중지
+
+Stop 버튼 선택
+
+POST /projects/{project_id}/training-jobs/{job_id}/stop
+
+stop_requested 값을 true로 변경
+
+실행 중인 프로세스가 있으면 종료 요청
+
+상태를 STOPPING 또는 STOPPED로 변경
+
+
+8. 진행률 및 로그 확인
+
+학습 중에는 화면이 주기적으로 학습 목록을 다시 조회합니다.
+
+카드에서 확인 가능한 항목:
+
+* 상태
+* 진행률
+* 현재 Epoch
+* 전체 Epoch
+* 최근 로그
+* run_dir
+* best.pt 경로
+* last.pt 경로
+* 오류 메시지
+
+
+9. 학습 삭제
+
+Delete 버튼 선택
+
+DELETE /projects/{project_id}/training-jobs/{job_id}
+
+실행 중인 학습은 삭제할 수 없습니다.
+
+학습 작업만 삭제하고 연결된 데이터셋 파일과 전처리 preset은 삭제하지 않습니다.
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+백엔드 API
+
+GET /yolo-models
+
+기본 YOLO 모델과 사용자 추가 모델 목록 조회
+
+
+POST /projects/{project_id}/training-models
+
+사용자 학습 모델 추가
+
+요청 형식: multipart/form-data
+
+필드:
+
+* user_id
+* name
+* description
+* task_type
+* model_file
+
+
+DELETE /projects/{project_id}/training-models/{model_id}
+
+사용자 학습 모델 삭제
+
+해당 모델을 사용하는 학습 작업이 있으면 삭제 불가
+
+
+GET /projects/{project_id}/training-jobs
+
+프로젝트별 학습 작업 목록 조회
+
+
+POST /projects/{project_id}/training-jobs
+
+새 학습 작업 생성
+
+요청 형식: JSON Body
+
+필드:
+
+* user_id
+* name
+* description
+* task_type
+* dataset_id
+* preprocessing_pipeline_id
+* yolo_model
+* optimizer
+* image_size
+* epochs
+* batch_min
+* batch_max
+* lr_initial_min
+* lr_initial_max
+* momentum_min
+* momentum_max
+
+
+POST /projects/{project_id}/training-jobs/{job_id}/start
+
+학습 시작
+
+
+POST /projects/{project_id}/training-jobs/{job_id}/stop
+
+학습 중지
+
+
+GET /projects/{project_id}/training-jobs/{job_id}/logs
+
+학습 로그, 진행률, 결과 조회
+
+
+DELETE /projects/{project_id}/training-jobs/{job_id}
+
+학습 작업 삭제
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+DB 테이블
+
+training_jobs
+
+주요 컬럼:
+
+* id
+* project_id
+* dataset_id
+* preprocessing_pipeline_id
+* user_id
+* name
+* description
+* task_type
+* yolo_model
+* optimizer
+* image_size
+* epochs
+* batch_min
+* batch_max
+* lr_initial_min
+* lr_initial_max
+* momentum_min
+* momentum_max
+* status
+* progress
+* current_epoch
+* logs_json
+* result_json
+* run_dir
+* stop_requested
+* started_at
+* completed_at
+* created_at
+* updated_at
+
+
+training_models
+
+주요 컬럼:
+
+* id
+* project_id
+* user_id
+* model_key
+* name
+* description
+* task_type
+* original_filename
+* model_path
+* file_size
+* source
+* status
+* created_at
+* updated_at
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+주의 사항
+
+실제 YOLO 학습을 실행하려면 백엔드 가상환경에 ultralytics 패키지가 필요합니다.
+
+설치 예시:
+
+pip install ultralytics
+
+ultralytics가 없으면 현재 구현은 개발 확인용 시뮬레이션으로 진행률과 로그를 생성합니다.
+
+기본 YOLO 모델은 ultralytics가 실행될 때 로컬에 없으면 다운로드가 필요할 수 있습니다.
+네트워크가 불안정한 환경에서는 사용자가 직접 .pt 모델 파일을 추가해서 사용하는 방식이 더 안정적입니다.
+--------------------------------------------------------------------------------------------------------------------

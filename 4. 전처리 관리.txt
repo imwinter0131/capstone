@@ -1,0 +1,212 @@
+4. 전처리 관리
+
+프로젝트 안에서 학습 전에 사용할 전처리 preset을 저장, 수정, 삭제하는 기능입니다.
+
+현재 단계에서는 실제 이미지 변환 파일을 새로 만들지 않습니다.
+대신 5. 학습 관리에서 선택할 수 있는 전처리 설정값을 프로젝트 단위로 관리합니다.
+
+--------------------------------------------------------------------------------------------------------------------
+기능 범위
+
+포함 기능
+
+* 프로젝트별 전처리 preset 목록 조회
+* 새 전처리 preset 생성
+* 기존 전처리 preset 수정
+* 기존 전처리 preset 삭제
+* 작업 유형 선택: 탐지 Detect / 분류 Classify
+* Image Size 설정
+* Keep Aspect Ratio 설정
+* Normalize 설정
+* Train / Val / Test Split 설정
+* Augmentation 설정
+
+제외 기능
+
+* 실제 이미지 파일 변환
+* 변환된 데이터셋 zip 생성
+* 라벨 좌표 재계산
+* 전처리 결과 미리보기
+* 실제 YOLO 학습 실행
+
+위 제외 기능은 학습 실행 단계에서 연결하는 것이 안전합니다.
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+전처리 항목
+
+Image Pipeline
+
+* Image Size
+* Keep Aspect Ratio
+* Normalize: none / zero_one / imagenet
+
+
+Dataset Split
+
+* Train Split
+* Val Split
+* Test Split
+
+Train / Val / Test 합계는 1.0
+
+
+Augmentation
+
+* Horizontal Flip
+* Vertical Flip
+* Rotation Degrees
+* HSV H
+* HSV S
+* HSV V
+* Mosaic
+* MixUp
+* Random Crop
+* Blur
+* Noise
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+파일별 역할
+
+Backend 폴더 (FastAPI + PostgreSQL)
+
+database.py: PostgreSQL 데이터베이스 연결 설정
+
+models.py: PreprocessingPipeline 테이블 정의 포함
+
+main.py: 전처리 preset 생성, 조회, 수정, 삭제 API
+
+venv/: 백엔드 전용 가상환경 폴더
+
+
+Frontend 폴더 (React)
+
+src/PreprocessingManage.jsx: 전처리 preset 목록, 생성, 수정, 삭제 화면
+
+src/PreprocessingManage.css: 전처리 관리 화면 전용 다크 UI 디자인
+
+src/App.jsx: /projects/{project_id}/preprocessing 주소를 PreprocessingManage.jsx와 연결
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+실행 프로세스
+
+1. 전처리 화면 이동
+
+데이터셋 관리 화면에서 Preprocessing 버튼 선택
+
+/projects/{project_id}/preprocessing 주소 이동
+
+App.jsx에서 PreprocessingManage.jsx 표시
+
+
+2. 전처리 preset 목록 조회
+
+GET /projects/{project_id}/preprocessing-pipelines?user_id={user_id}
+
+FastAPI에서 현재 사용자 소유 프로젝트 확인
+
+PostgreSQL preprocessing_pipelines 테이블에서 프로젝트에 속한 preset 목록 조회
+
+
+3. 전처리 preset 생성
+
+New Pipeline 버튼 선택
+
+입력 항목:
+
+* 전처리 이름
+* 설명
+* 작업 유형
+* Image Size
+* Normalize
+* Keep Aspect Ratio
+* Train / Val / Test Split
+* Augmentation 옵션
+
+POST /projects/{project_id}/preprocessing-pipelines
+
+JSON Body로 설정값 전송
+
+
+4. 전처리 preset 저장
+
+FastAPI에서 작업 유형, 이미지 크기, 분할 비율, 증강 값 검증
+
+전처리 설정값을 config_json에 JSON 문자열로 저장
+
+목록 화면에서 preset 카드 표시
+
+
+5. 학습 관리 연결
+
+5. 학습 관리의 새 학습 생성 화면에서 전처리 preset 선택
+
+선택한 전처리 preset의 task_type과 학습 task_type 일치 여부 확인
+
+일치하지 않으면 학습 생성 차단
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+백엔드 API
+
+GET /preprocessing-options
+
+전처리 선택 옵션 조회
+
+
+GET /projects/{project_id}/preprocessing-pipelines
+
+프로젝트별 전처리 preset 목록 조회
+
+
+POST /projects/{project_id}/preprocessing-pipelines
+
+새 전처리 preset 생성
+
+
+PATCH /projects/{project_id}/preprocessing-pipelines/{pipeline_id}
+
+전처리 preset 수정
+
+
+DELETE /projects/{project_id}/preprocessing-pipelines/{pipeline_id}
+
+전처리 preset 삭제
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+DB 테이블
+
+preprocessing_pipelines
+
+주요 컬럼:
+
+* id
+* project_id
+* user_id
+* name
+* description
+* task_type
+* image_size
+* train_split
+* val_split
+* test_split
+* config_json
+* status
+* created_at
+* updated_at
+
+config_json에는 keep_aspect_ratio, normalize, augmentations 값 저장
+--------------------------------------------------------------------------------------------------------------------
