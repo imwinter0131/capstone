@@ -1,0 +1,3 @@
+class_id: 0
+class_name: circle
+image: train/circle/circle_001.png

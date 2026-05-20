@@ -296,6 +296,10 @@ button {
   padding: 14px 16px;
 }
 
+.modal-message {
+  margin: 16px 0 0;
+}
+
 .project-state {
   min-height: 280px;
   display: grid;

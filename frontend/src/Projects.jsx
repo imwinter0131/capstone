@@ -25,6 +25,7 @@ function Projects({ user }) {
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [modalError, setModalError] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
   const [editingProject, setEditingProject] = useState(null);
   const [form, setForm] = useState(emptyForm);
@@ -84,6 +85,7 @@ function Projects({ user }) {
     setForm(emptyForm);
     setModalOpen(true);
     setError("");
+    setModalError("");
   }
 
   function openEditModal(project) {
@@ -95,6 +97,7 @@ function Projects({ user }) {
     });
     setModalOpen(true);
     setError("");
+    setModalError("");
   }
 
   function closeModal() {
@@ -102,6 +105,7 @@ function Projects({ user }) {
     setModalOpen(false);
     setEditingProject(null);
     setForm(emptyForm);
+    setModalError("");
   }
 
   function handleChange(e) {
@@ -116,11 +120,12 @@ function Projects({ user }) {
     e.preventDefault();
 
     if (!form.name.trim()) {
-      setError("프로젝트명을 입력하세요.");
+      setModalError("프로젝트명을 입력하세요.");
       return;
     }
 
     setSaving(true);
+    setModalError("");
     setError("");
 
     const payload = {
@@ -147,14 +152,14 @@ function Projects({ user }) {
       const data = await response.json();
 
       if (!response.ok) {
-        setError(data.detail || "프로젝트 저장 중 오류가 발생했습니다.");
+        setModalError(data.detail || "프로젝트 저장 중 오류가 발생했습니다.");
         return;
       }
 
       await loadProjects();
       closeModal();
     } catch {
-      setError("서버와 연결할 수 없습니다. 백엔드 서버를 확인하세요.");
+      setModalError("서버와 연결할 수 없습니다. 백엔드 서버를 확인하세요.");
     } finally {
       setSaving(false);
     }
@@ -340,6 +345,8 @@ function Projects({ user }) {
                 Close
               </button>
             </div>
+
+            {(modalError || error) && <div className="project-error modal-message">{modalError || error}</div>}
 
             <div className="form-grid">
               <label className="field wide">

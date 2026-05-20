@@ -1,0 +1,3 @@
+class_id: 1
+class_name: square
+image: train/square/square_074.png

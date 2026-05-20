@@ -3,6 +3,7 @@ import csv
 import importlib.util
 import json
 from pathlib import Path
+from queue import Empty, Queue
 import re
 import shutil
 import subprocess
@@ -69,14 +70,12 @@ DEFAULT_AUGMENTATIONS = {
     "hsv_v": 0.4,
     "mosaic": True,
     "mixup": 0.0,
-    "random_crop": False,
-    "blur": False,
-    "noise": False,
 }
 
 TRAINING_THREADS: Dict[int, threading.Thread] = {}
 TRAINING_STOP_EVENTS: Dict[int, threading.Event] = {}
 TRAINING_PROCESSES: Dict[int, subprocess.Popen] = {}
+STOPPING_STALE_SECONDS = 8.0
 
 
 class UserAuth(BaseModel):
@@ -100,10 +99,11 @@ class ProjectUpdate(BaseModel):
 
 class PreprocessingPipelinePayload(BaseModel):
     user_id: int
+    dataset_id: Optional[int] = None
     name: str = Field(min_length=1, max_length=160)
     description: Optional[str] = ""
     task_type: str = "detect"
-    image_size: int = 640
+    image_size: int = 224
     keep_aspect_ratio: bool = True
     normalize: str = "zero_one"
     train_split: float = 0.8
@@ -428,9 +428,6 @@ def build_preprocessing_config(payload: PreprocessingPipelinePayload):
         "hsv_v": normalize_float(raw_aug.get("hsv_v", DEFAULT_AUGMENTATIONS["hsv_v"]), DEFAULT_AUGMENTATIONS["hsv_v"]),
         "mosaic": normalize_bool(raw_aug.get("mosaic", DEFAULT_AUGMENTATIONS["mosaic"])),
         "mixup": normalize_float(raw_aug.get("mixup", DEFAULT_AUGMENTATIONS["mixup"]), DEFAULT_AUGMENTATIONS["mixup"]),
-        "random_crop": normalize_bool(raw_aug.get("random_crop", DEFAULT_AUGMENTATIONS["random_crop"])),
-        "blur": normalize_bool(raw_aug.get("blur", DEFAULT_AUGMENTATIONS["blur"])),
-        "noise": normalize_bool(raw_aug.get("noise", DEFAULT_AUGMENTATIONS["noise"])),
     }
 
     if augmentations["rotation_degrees"] < 0 or augmentations["rotation_degrees"] > 180:
@@ -444,6 +441,40 @@ def build_preprocessing_config(payload: PreprocessingPipelinePayload):
         "normalize": normalize,
         "augmentations": augmentations,
     }
+
+
+def attach_dataset_reference_to_pipeline_config(
+    db: Session,
+    *,
+    project_id: int,
+    payload: PreprocessingPipelinePayload,
+    config: Dict[str, Any],
+):
+    if not payload.dataset_id:
+        return config
+
+    task_type = payload.task_type.strip().lower()
+    dataset = (
+        db.query(models.Dataset)
+        .filter(
+            models.Dataset.id == payload.dataset_id,
+            models.Dataset.project_id == project_id,
+            models.Dataset.user_id == payload.user_id,
+        )
+        .first()
+    )
+    if not dataset:
+        raise HTTPException(status_code=404, detail="연결할 데이터셋을 찾을 수 없습니다.")
+    if dataset.task_type != task_type:
+        raise HTTPException(status_code=400, detail="데이터셋과 전처리 작업 유형이 일치해야 합니다.")
+
+    config.update(
+        {
+            "dataset_id": dataset.id,
+            "dataset_name": dataset.name,
+        }
+    )
+    return config
 
 
 def normalize_split_values(train_split: float, val_split: float, test_split: float):
@@ -482,29 +513,23 @@ def recommend_preprocessing_pipeline(report: Dict[str, Any], task_type: str, dat
         notes.append("A simple train/validation split was selected for a smaller dataset.")
 
     if task_type == "classify":
-        image_size = 224 if image_count < 1000 else 320
+        image_size = 224
         normalize = "imagenet"
         augmentations = {
             **DEFAULT_AUGMENTATIONS,
             "rotation_degrees": 10 if image_count < 300 else 5,
             "mosaic": False,
             "mixup": 0.05 if image_count >= 500 and class_count >= 2 else 0.0,
-            "random_crop": True,
-            "blur": image_count < 200,
-            "noise": image_count < 200,
         }
-        notes.append("Classification uses ImageNet normalization and crop-based augmentation.")
+        notes.append("Classification uses ImageNet normalization and lightweight color/geometric augmentation.")
     else:
-        image_size = 768 if image_count >= 3000 or class_count >= 20 else 640
+        image_size = 224
         normalize = "zero_one"
         augmentations = {
             **DEFAULT_AUGMENTATIONS,
             "rotation_degrees": 5 if image_count < 300 else 0,
             "mosaic": image_count >= 50,
             "mixup": 0.05 if image_count >= 500 and class_count >= 2 else 0.0,
-            "random_crop": False,
-            "blur": False,
-            "noise": image_count < 150,
         }
         notes.append("Detection keeps YOLO-friendly resize, HSV, and mosaic augmentation.")
 
@@ -571,7 +596,12 @@ def create_recommended_preprocessing_pipeline(
         test_split=recommendation["test_split"],
         augmentations=recommendation["augmentations"],
     )
-    config = build_preprocessing_config(payload)
+    config = attach_dataset_reference_to_pipeline_config(
+        db,
+        project_id=project_id,
+        payload=payload,
+        config=build_preprocessing_config(payload),
+    )
     config.update(
         {
             "source": "auto",
@@ -983,6 +1013,79 @@ def update_training_progress(
     db.refresh(job)
 
 
+def is_training_process_alive(job_id: int):
+    process = TRAINING_PROCESSES.get(job_id)
+    return bool(process and process.poll() is None)
+
+
+def is_training_thread_alive(job_id: int):
+    thread = TRAINING_THREADS.get(job_id)
+    return bool(thread and thread.is_alive())
+
+
+def stop_training_process(job_id: int, *, wait_timeout: float = 1.0):
+    process = TRAINING_PROCESSES.get(job_id)
+    if not process or process.poll() is not None:
+        return
+
+    try:
+        process.terminate()
+        process.wait(timeout=wait_timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+    except Exception:
+        pass
+
+
+def mark_training_stopped(db: Session, job: models.TrainingJob, *, message: Optional[str] = None):
+    result = read_json_dict(job.result_json)
+    result.setdefault("message", "사용자 요청으로 학습이 중지되었습니다.")
+    update_training_progress(
+        db,
+        job,
+        status="STOPPED",
+        progress=job.progress,
+        current_epoch=job.current_epoch,
+        result=result,
+    )
+    job.stop_requested = False
+    job.completed_at = datetime.utcnow()
+    db.commit()
+    db.refresh(job)
+    if message:
+        append_training_log(db, job, message)
+
+
+def reconcile_stopping_training_job(db: Session, job: models.TrainingJob, *, force: bool = False):
+    if job.status != "STOPPING":
+        return
+
+    stop_event = TRAINING_STOP_EVENTS.get(job.id)
+    if stop_event:
+        stop_event.set()
+
+    updated_at = job.updated_at or job.started_at or datetime.utcnow()
+    stopping_seconds = max(0.0, (datetime.utcnow() - updated_at).total_seconds())
+    should_force = force or stopping_seconds >= STOPPING_STALE_SECONDS
+
+    if should_force and is_training_process_alive(job.id):
+        stop_training_process(job.id, wait_timeout=1.0)
+
+    if should_force and is_training_thread_alive(job.id):
+        thread = TRAINING_THREADS.get(job.id)
+        if thread:
+            thread.join(timeout=0.5)
+
+    process_alive = is_training_process_alive(job.id)
+    thread_alive = is_training_thread_alive(job.id)
+    if not process_alive and (not thread_alive or should_force):
+        mark_training_stopped(db, job, message="학습 중지 상태를 정리했습니다.")
+
+
 def find_first_dataset_config(dataset_dir: Path):
     candidates = []
     for name in ("data.yaml", "data.yml", "dataset.yaml", "dataset.yml"):
@@ -1006,7 +1109,51 @@ def write_training_runner(run_dir: Path, job: models.TrainingJob, model_path: st
             [
                 "from ultralytics import YOLO",
                 "",
+                f"TOTAL_EPOCHS = {int(job.epochs)}",
+                "_last_emitted_progress = -1.0",
+                "",
+                "def _trainer_epoch_total(trainer):",
+                "    epoch = int(getattr(trainer, 'epoch', -1)) + 1",
+                "    total = int(getattr(trainer, 'epochs', TOTAL_EPOCHS) or TOTAL_EPOCHS)",
+                "    return max(1, epoch), max(1, total)",
+                "",
+                "def _emit_progress(epoch, total, batch=0, batches=0, progress=None, force=False):",
+                "    global _last_emitted_progress",
+                "    if progress is None:",
+                "        ratio = 1.0 if not batches else max(0.0, min(1.0, batch / batches))",
+                "        progress = (((epoch - 1) + ratio) / total) * 100",
+                "    progress = max(0.0, min(100.0, float(progress)))",
+                "    if force or progress - _last_emitted_progress >= 0.25:",
+                "        print(f'DL_PROGRESS epoch={epoch} total={total} batch={batch} batches={batches} progress={progress:.2f}', flush=True)",
+                "        _last_emitted_progress = progress",
+                "",
+                "def emit_batch_progress(trainer):",
+                "    epoch, total = _trainer_epoch_total(trainer)",
+                "    batch_index = int(getattr(trainer, 'batch_i', -1)) + 1",
+                "    train_loader = getattr(trainer, 'train_loader', None)",
+                "    try:",
+                "        batches = len(train_loader) if train_loader is not None else 0",
+                "    except Exception:",
+                "        batches = 0",
+                "    if batch_index <= 0:",
+                "        batch_index = 1",
+                "    _emit_progress(epoch, total, batch_index, batches)",
+                "",
+                "def emit_epoch_progress(trainer):",
+                "    epoch, total = _trainer_epoch_total(trainer)",
+                "    _emit_progress(epoch, total, progress=(epoch / total) * 100, force=True)",
+                "",
                 f"model = YOLO({model_path!r})",
+                "for event_name, callback in (",
+                "    ('on_train_batch_end', emit_batch_progress),",
+                "    ('on_fit_epoch_end', emit_epoch_progress),",
+                "    ('on_train_epoch_end', emit_epoch_progress),",
+                "):",
+                "    try:",
+                "        model.add_callback(event_name, callback)",
+                "    except Exception:",
+                "        pass",
+                "",
                 "model.train(",
                 f"    data={data_target!r},",
                 f"    epochs={int(job.epochs)},",
@@ -1015,6 +1162,7 @@ def write_training_runner(run_dir: Path, job: models.TrainingJob, model_path: st
                 f"    project={str(run_dir)!r},",
                 f"    name='ultralytics',",
                 "    exist_ok=True,",
+                "    verbose=True,",
                 ")",
             ]
         ),
@@ -1023,21 +1171,111 @@ def write_training_runner(run_dir: Path, job: models.TrainingJob, model_path: st
     return runner_path
 
 
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def clean_training_output(raw: str):
+    text = ANSI_ESCAPE_RE.sub("", raw or "")
+    return text.replace("\x00", "").strip()
+
+
+def enqueue_training_output(pipe, output_queue: Queue):
+    buffer = []
+    try:
+        while True:
+            char = pipe.read(1)
+            if not char:
+                break
+            if char in {"\n", "\r"}:
+                text = clean_training_output("".join(buffer))
+                if text:
+                    output_queue.put(text)
+                buffer = []
+            else:
+                buffer.append(char)
+        text = clean_training_output("".join(buffer))
+        if text:
+            output_queue.put(text)
+    finally:
+        output_queue.put(None)
+
+
+def parse_tqdm_training_progress(line: str, total_epochs: int, fallback_epoch: int = 0):
+    total = max(1, int(total_epochs or 1))
+
+    marker = re.search(
+        r"DL_PROGRESS\s+epoch=(\d+)\s+total=(\d+)"
+        r"(?:\s+batch=(\d+)\s+batches=(\d+))?"
+        r"(?:\s+progress=(\d+(?:\.\d+)?))?",
+        line,
+    )
+    if marker:
+        marker_total = max(1, int(marker.group(2)))
+        if marker_total == total:
+            epoch = clamp_epoch_value(int(marker.group(1)), total)
+            explicit_progress = to_float_or_none(marker.group(5))
+            if explicit_progress is not None:
+                progress = max(0, min(99, explicit_progress))
+            else:
+                batches = max(0, int(marker.group(4) or 0))
+                batch = max(0, int(marker.group(3) or 0))
+                batch_ratio = max(0.0, min(1.0, batch / batches)) if batches else 1.0
+                progress = ((max(0, epoch - 1) + batch_ratio) / total) * 100
+            return {
+                "epoch": epoch,
+                "progress": round(min(99, progress), 2),
+                "log": f"Epoch {epoch}/{total} 진행률 {round(min(100, progress), 1)}%",
+            }
+
+    current_epoch = None
+    epoch_match = re.search(r"^\s*(\d+)\s*/\s*(\d+)\b", line)
+    if epoch_match and max(1, int(epoch_match.group(2))) == total:
+        current_epoch = clamp_epoch_value(int(epoch_match.group(1)), total)
+    elif "|" in line and "%" in line and fallback_epoch:
+        current_epoch = clamp_epoch_value(fallback_epoch, total)
+
+    if current_epoch is None:
+        return None
+
+    batch_ratio = 0.0
+    percent_match = re.search(r"(\d+(?:\.\d+)?)%\|", line)
+    if percent_match:
+        batch_ratio = max(0.0, min(1.0, float(percent_match.group(1)) / 100))
+    else:
+        fraction_match = re.search(r"\|\s*(\d+)\s*/\s*(\d+)\s*(?:\[|$)", line)
+        if fraction_match:
+            current_step = max(0, int(fraction_match.group(1)))
+            total_steps = max(1, int(fraction_match.group(2)))
+            batch_ratio = max(0.0, min(1.0, current_step / total_steps))
+        elif current_epoch > fallback_epoch:
+            batch_ratio = 0.02
+
+    epoch_base = max(0, current_epoch - 1)
+    progress = ((epoch_base + batch_ratio) / total) * 100
+    if batch_ratio >= 0.999:
+        progress = (current_epoch / total) * 100
+
+    return {
+        "epoch": current_epoch,
+        "progress": min(99, round(progress, 2)),
+        "log": f"Epoch {current_epoch}/{total} 진행률 {round(min(100, progress), 1)}%",
+    }
+
+
 def run_simulated_training(db: Session, job: models.TrainingJob, stop_event: threading.Event):
     append_training_log(db, job, "개발 환경 학습 시뮬레이션을 시작합니다.")
     epochs = max(1, int(job.epochs or 1))
     for epoch in range(1, epochs + 1):
-        db.refresh(job)
-        if stop_event.is_set() or job.stop_requested:
-            update_training_progress(db, job, status="STOPPED", progress=job.progress, current_epoch=epoch - 1)
-            append_training_log(db, job, "사용자 요청으로 학습을 중지했습니다.")
-            job.completed_at = datetime.utcnow()
-            db.commit()
-            return
+        steps_per_epoch = 6
+        for step in range(1, steps_per_epoch + 1):
+            db.refresh(job)
+            if stop_event.is_set() or job.stop_requested:
+                mark_training_stopped(db, job, message="사용자 요청으로 학습을 중지했습니다.")
+                return
 
-        time.sleep(0.35)
-        progress = round((epoch / epochs) * 100, 2)
-        update_training_progress(db, job, status="RUNNING", progress=progress, current_epoch=epoch)
+            time.sleep(0.08)
+            progress = round((((epoch - 1) + (step / steps_per_epoch)) / epochs) * 100, 2)
+            update_training_progress(db, job, status="RUNNING", progress=progress, current_epoch=epoch)
         append_training_log(db, job, f"Epoch {epoch}/{epochs} 완료")
 
     result = {
@@ -1068,51 +1306,100 @@ def run_ultralytics_training(
     append_training_log(db, job, "ultralytics 기반 YOLO 학습 프로세스를 시작합니다.")
 
     process = subprocess.Popen(
-        [sys.executable, str(runner_path)],
+        [sys.executable, "-u", str(runner_path)],
         cwd=str(run_dir),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
+        bufsize=1,
     )
     TRAINING_PROCESSES[job.id] = process
-    last_progress = max(5, job.progress or 0)
+    output_queue = Queue()
+    reader_thread = threading.Thread(
+        target=enqueue_training_output,
+        args=(process.stdout, output_queue),
+        daemon=True,
+    )
+    reader_thread.start()
+
+    total_epochs = max(1, int(job.epochs or 1))
+    last_progress = max(1, float(job.progress or 0))
+    last_epoch = clamp_epoch_value(job.current_epoch, total_epochs)
+    last_progress_log = -1.0
+    last_progress_log_epoch = -1
+    last_progress_update_at = 0.0
+    reader_done = False
+    terminate_requested = False
     update_training_progress(db, job, status="RUNNING", progress=last_progress)
 
     try:
         while True:
-            if stop_event.is_set():
-                process.terminate()
+            if stop_event.is_set() and not terminate_requested:
+                stop_training_process(job.id, wait_timeout=0.5)
+                terminate_requested = True
                 append_training_log(db, job, "학습 프로세스 종료 요청을 보냈습니다.")
 
-            line = process.stdout.readline() if process.stdout else ""
+            line = ""
+            try:
+                item = output_queue.get(timeout=0.2)
+                if item is None:
+                    reader_done = True
+                else:
+                    line = item
+            except Empty:
+                pass
+
             if line:
-                append_training_log(db, job, line.strip())
-                epoch_match = re.search(r"^\s*(\d+)\s*/\s*(\d+)\b", line)
-                if epoch_match:
-                    total_epochs = max(1, int(job.epochs or 1))
-                    parsed_total = max(1, int(epoch_match.group(2)))
-                    if parsed_total == total_epochs:
-                        current = clamp_epoch_value(int(epoch_match.group(1)), total_epochs)
-                        next_progress = min(95, round((current / total_epochs) * 95, 2))
-                        last_progress = max(last_progress, next_progress)
-                        update_training_progress(db, job, status="RUNNING", progress=last_progress, current_epoch=current)
+                progress_info = parse_tqdm_training_progress(line, total_epochs, last_epoch)
+                if progress_info:
+                    current_epoch = max(last_epoch, progress_info["epoch"])
+                    next_progress = max(last_progress, progress_info["progress"])
+                    now = time.monotonic()
+
+                    should_update = (
+                        current_epoch > last_epoch
+                        or next_progress - last_progress >= 0.35
+                        or now - last_progress_update_at >= 1.0
+                    )
+                    if should_update:
+                        last_epoch = current_epoch
+                        last_progress = next_progress
+                        last_progress_update_at = now
+                        update_training_progress(
+                            db,
+                            job,
+                            status="RUNNING",
+                            progress=last_progress,
+                            current_epoch=last_epoch,
+                        )
+
+                    should_log_progress = (
+                        current_epoch > last_progress_log_epoch
+                        or last_progress - last_progress_log >= 5
+                        or last_progress >= 99
+                    )
+                    if should_log_progress:
+                        append_training_log(db, job, progress_info["log"])
+                        last_progress_log = last_progress
+                        last_progress_log_epoch = current_epoch
+                else:
+                    append_training_log(db, job, line)
 
             if process.poll() is not None:
-                break
+                if reader_done or output_queue.empty():
+                    break
 
             if not line:
                 db.refresh(job)
                 if job.stop_requested:
-                    process.terminate()
                     stop_event.set()
-                time.sleep(0.25)
+                    stop_training_process(job.id, wait_timeout=0.5)
 
         return_code = process.wait()
         if stop_event.is_set():
-            update_training_progress(db, job, status="STOPPED", progress=job.progress)
-            append_training_log(db, job, "학습이 중지되었습니다.")
+            mark_training_stopped(db, job, message="학습이 중지되었습니다.")
             return
 
         weights_dir = run_dir / "ultralytics" / "weights"
@@ -1135,8 +1422,11 @@ def run_ultralytics_training(
             append_training_log(db, job, "YOLO 학습이 실패했습니다.")
     finally:
         TRAINING_PROCESSES.pop(job.id, None)
-        job.completed_at = datetime.utcnow()
-        db.commit()
+        if job.status == "STOPPING":
+            mark_training_stopped(db, job, message="학습 중지 상태를 정리했습니다.")
+        elif job.status in {"COMPLETED", "FAILED", "STOPPED"}:
+            job.completed_at = job.completed_at or datetime.utcnow()
+            db.commit()
 
 
 def training_worker(job_id: int, simulate: bool = False):
@@ -1576,7 +1866,7 @@ def list_preprocessing_options():
         "task_types": sorted(ALLOWED_TASKS),
         "normalizations": sorted(ALLOWED_NORMALIZATIONS),
         "default_augmentations": DEFAULT_AUGMENTATIONS,
-        "image_size": {"min": 64, "max": 2048, "default": 640},
+        "image_size": {"min": 64, "max": 2048, "default": 224},
         "split": {"default_train": 0.8, "default_val": 0.2, "default_test": 0.0},
     }
 
@@ -1624,7 +1914,12 @@ def create_preprocessing_pipeline(
     if duplicate:
         raise HTTPException(status_code=400, detail="이미 같은 이름의 전처리 파이프라인이 있습니다.")
 
-    config = build_preprocessing_config(payload)
+    config = attach_dataset_reference_to_pipeline_config(
+        db,
+        project_id=project_id,
+        payload=payload,
+        config=build_preprocessing_config(payload),
+    )
     pipeline = models.PreprocessingPipeline(
         project_id=project_id,
         user_id=payload.user_id,
@@ -1930,6 +2225,19 @@ def delete_dataset(
         raise HTTPException(status_code=400, detail="학습에서 사용 중인 데이터셋은 삭제할 수 없습니다.")
 
     dataset_dir = Path(dataset.zip_path).parent
+    linked_pipelines = (
+        db.query(models.PreprocessingPipeline)
+        .filter(
+            models.PreprocessingPipeline.project_id == project_id,
+            models.PreprocessingPipeline.user_id == user_id,
+        )
+        .all()
+    )
+    for pipeline in linked_pipelines:
+        config = read_json_dict(pipeline.config_json)
+        if int(config.get("dataset_id") or 0) == dataset_id:
+            db.delete(pipeline)
+
     db.delete(dataset)
     db.commit()
     try:
@@ -1958,6 +2266,9 @@ def list_training_jobs(
         .order_by(models.TrainingJob.created_at.desc())
         .all()
     )
+    for job, _, _ in rows:
+        reconcile_stopping_training_job(db, job)
+
     return {
         "project": serialize_project(project),
         "training_jobs": [serialize_training_job(job, dataset, pipeline) for job, dataset, pipeline in rows],
@@ -2158,9 +2469,10 @@ def stop_training_job(
     )
     if not job:
         raise HTTPException(status_code=404, detail="학습을 찾을 수 없습니다.")
-    if job.status not in {"QUEUED", "RUNNING"}:
+    if job.status not in {"QUEUED", "RUNNING", "STOPPING"}:
         raise HTTPException(status_code=400, detail="실행 중인 학습만 중지할 수 있습니다.")
 
+    already_stopping = job.status == "STOPPING"
     job.stop_requested = True
     job.status = "STOPPING"
     job.updated_at = datetime.utcnow()
@@ -2171,13 +2483,17 @@ def stop_training_job(
     if stop_event:
         stop_event.set()
 
-    process = TRAINING_PROCESSES.get(job.id)
-    if process and process.poll() is None:
-        process.terminate()
+    stop_training_process(job.id, wait_timeout=1.0 if already_stopping else 0.2)
 
-    append_training_log(db, job, "사용자가 학습 중지를 요청했습니다.")
+    if already_stopping:
+        append_training_log(db, job, "중지 중인 학습을 다시 정리합니다.")
+    else:
+        append_training_log(db, job, "사용자가 학습 중지를 요청했습니다.")
+
+    reconcile_stopping_training_job(db, job, force=already_stopping)
+    db.refresh(job)
     return {
-        "message": "학습 중지를 요청했습니다.",
+        "message": "학습을 중지했습니다." if job.status == "STOPPED" else "학습 중지를 요청했습니다.",
         "training_job": serialize_training_job(job),
     }
 
@@ -2204,8 +2520,8 @@ def get_training_job_logs(
     return {
         "job_id": job.id,
         "status": job.status,
-        "progress": job.progress,
-        "current_epoch": job.current_epoch,
+        "progress": clamp_progress_value(job.progress, job.status),
+        "current_epoch": clamp_epoch_value(job.current_epoch, job.epochs),
         "logs": read_json_list(job.logs_json),
         "result": read_json_dict(job.result_json),
     }

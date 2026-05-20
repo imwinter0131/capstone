@@ -112,6 +112,44 @@ function getDisplayEpoch(job) {
   return Math.max(0, Math.min(total, Number(job?.current_epoch || 0)));
 }
 
+function ProgressMeter({ job }) {
+  const targetProgress = getDisplayProgress(job);
+  const [displayProgress, setDisplayProgress] = useState(targetProgress);
+
+  useEffect(() => {
+    setDisplayProgress(getDisplayProgress(job));
+  }, [job?.id]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setDisplayProgress((prev) => {
+        const current = Number.isFinite(Number(prev)) ? Number(prev) : 0;
+        const target = Number.isFinite(Number(targetProgress)) ? Number(targetProgress) : 0;
+        if (Math.abs(target - current) < 0.12) return target;
+        if (target < current) return target;
+
+        const step = Math.max((target - current) * 0.18, 0.35);
+        return Math.min(target, current + step);
+      });
+    }, 80);
+
+    return () => window.clearInterval(timer);
+  }, [targetProgress]);
+
+  return (
+    <>
+      <div className="progress-head">
+        <span>Progress</span>
+        <strong>{Math.round(displayProgress)}%</strong>
+      </div>
+      <div className="progress-track">
+        <div className="progress-bar" style={{ width: `${displayProgress}%` }} />
+      </div>
+      <small>Epoch {getDisplayEpoch(job)} / {job?.epochs || 0}</small>
+    </>
+  );
+}
+
 function getPrimaryMetricKey(job) {
   const metrics = job?.result?.metrics || {};
   if (job?.task_type === "classify") {
@@ -136,38 +174,6 @@ function formatDelta(value) {
 function artifactImageUrl(projectId, userId, path) {
   if (!projectId || !userId || !path) return "";
   return `${API_BASE}/projects/${projectId}/artifact-file?user_id=${userId}&path=${encodeURIComponent(path)}`;
-}
-
-function buildTuningSuggestions(job, bestJob) {
-  if (!job) return ["학습을 선택하면 결과를 바탕으로 다음 실험 방향을 제안합니다."];
-  const metrics = job.result?.metrics || {};
-  const suggestions = [];
-  const trainLoss = Number(metrics.train_loss);
-  const valLoss = Number(metrics.val_loss);
-  const precision = Number(metrics.precision);
-  const recall = Number(metrics.recall);
-  const selectedScore = getPrimaryScore(job);
-  const bestScore = getPrimaryScore(bestJob);
-
-  if (Number.isFinite(trainLoss) && Number.isFinite(valLoss) && valLoss > trainLoss * 1.35) {
-    suggestions.push("Validation Loss가 Train Loss보다 높습니다. LR Initial Max를 낮추거나 augmentation을 조금 강화한 재학습을 권장합니다.");
-  }
-  if (Number.isFinite(precision) && Number.isFinite(recall) && recall + 0.08 < precision) {
-    suggestions.push("Recall이 Precision보다 낮습니다. Image Size 또는 Epochs를 늘려 놓치는 객체를 줄이는 실험을 해볼 수 있습니다.");
-  }
-  if (Number.isFinite(precision) && Number.isFinite(recall) && precision + 0.08 < recall) {
-    suggestions.push("Precision이 Recall보다 낮습니다. 데이터 라벨 품질을 확인하고 LR 범위를 좁혀 오탐을 줄이는 실험을 권장합니다.");
-  }
-  if (Number.isFinite(selectedScore) && Number.isFinite(bestScore) && job.id !== bestJob?.id && selectedScore < bestScore) {
-    suggestions.push("현재 선택한 학습보다 더 좋은 완료 결과가 있습니다. Best Run의 설정을 기준으로 다시 튜닝하는 것이 좋습니다.");
-  }
-  if (job.status === "FAILED") {
-    suggestions.push("학습이 실패했습니다. 로그의 오류 메시지와 data.yaml, 라벨 파일 구조, 모델 파일 호환성을 먼저 확인하세요.");
-  }
-  if (!suggestions.length) {
-    suggestions.push("지표가 안정적입니다. 더 높은 성능을 원하면 Epochs를 조금 늘리거나 Image Size를 한 단계 높여 비교하세요.");
-  }
-  return suggestions.slice(0, 3);
 }
 
 function TrainingMetricCards({ job }) {
@@ -256,7 +262,6 @@ function TrainingManage({ user, projectId }) {
   const [modelSaving, setModelSaving] = useState(false);
   const [expandedLogs, setExpandedLogs] = useState({});
   const [selectedJobId, setSelectedJobId] = useState("");
-  const [livePreviewEnabled, setLivePreviewEnabled] = useState(true);
 
   const userId = user?.user_id;
   const userEmail = user?.email || "user";
@@ -272,8 +277,14 @@ function TrainingManage({ user, projectId }) {
   );
 
   const pipelineOptions = useMemo(
-    () => pipelines.filter((pipeline) => pipeline.task_type === form.task_type),
-    [form.task_type, pipelines],
+    () =>
+      pipelines.filter(
+        (pipeline) =>
+          pipeline.task_type === form.task_type &&
+          form.dataset_id &&
+          String(pipeline.dataset_id) === String(form.dataset_id),
+      ),
+    [form.task_type, form.dataset_id, pipelines],
   );
 
   const hasActiveJob = jobs.some((job) => ["QUEUED", "RUNNING", "STOPPING"].includes(job.status));
@@ -293,7 +304,6 @@ function TrainingManage({ user, projectId }) {
   const bestPrimaryScore = getPrimaryScore(bestJob);
   const selectedBestDelta =
     selectedPrimaryScore !== null && bestPrimaryScore !== null ? selectedPrimaryScore - bestPrimaryScore : null;
-  const tuningSuggestions = useMemo(() => buildTuningSuggestions(selectedJob, bestJob), [selectedJob, bestJob]);
   const previewArtifacts = previewArtifactKeys
     .map((key) => ({
       key,
@@ -360,10 +370,10 @@ function TrainingManage({ user, projectId }) {
   }, [projectId, userId]);
 
   useEffect(() => {
-    if (!livePreviewEnabled || !hasActiveJob) return undefined;
-    const timer = window.setInterval(() => loadPage(true), 2500);
+    if (!hasActiveJob) return undefined;
+    const timer = window.setInterval(() => loadPage(true), 600);
     return () => window.clearInterval(timer);
-  }, [livePreviewEnabled, hasActiveJob, projectId, userId]);
+  }, [hasActiveJob, projectId, userId]);
 
   useEffect(() => {
     const compatibleModel = modelOptions.some((model) => model.id === form.yolo_model);
@@ -581,7 +591,6 @@ function TrainingManage({ user, projectId }) {
   async function startJob(job) {
     setError("");
     setSelectedJobId(String(job.id));
-    setLivePreviewEnabled(true);
     try {
       const response = await fetch(`${API_BASE}/projects/${projectId}/training-jobs/${job.id}/start?user_id=${userId}`, {
         method: "POST",
@@ -649,10 +658,6 @@ function TrainingManage({ user, projectId }) {
     window.location.href = `/projects/${projectId}`;
   }
 
-  function goPreprocessing() {
-    window.location.href = `/projects/${projectId}/preprocessing`;
-  }
-
   function goTraining() {
     window.location.href = `/projects/${projectId}/training`;
   }
@@ -667,9 +672,6 @@ function TrainingManage({ user, projectId }) {
       <aside className="training-sidebar">
         <button className="nav-button" type="button" onClick={goDatasets}>
           Dataset Management
-        </button>
-        <button className="nav-button" type="button" onClick={goPreprocessing}>
-          Preprocessing
         </button>
         <button className="nav-button active" type="button" onClick={goTraining}>
           Training
@@ -727,11 +729,10 @@ function TrainingManage({ user, projectId }) {
             <div className="job-grid">
               {jobs.map((job) => {
                 const isActive = ["QUEUED", "RUNNING", "STOPPING"].includes(job.status);
+                const isStopping = job.status === "STOPPING";
                 const logs = job.logs || [];
                 const showLogs = Boolean(expandedLogs[job.id]);
                 const isSelected = String(selectedJob?.id) === String(job.id);
-                const displayProgress = getDisplayProgress(job);
-                const displayEpoch = getDisplayEpoch(job);
 
                 return (
                 <article className={`job-card ${isSelected ? "selected" : ""}`} key={job.id} onClick={() => setSelectedJobId(String(job.id))}>
@@ -752,7 +753,7 @@ function TrainingManage({ user, projectId }) {
                       <small>{job.dataset?.original_filename} · {prettyBytes(job.dataset?.file_size || 0)}</small>
                     </div>
                     <div>
-                      <span>Preprocessing</span>
+                      <span>Dataset Preprocessing</span>
                       <strong>{job.preprocessing_pipeline?.name || "None"}</strong>
                       <small>
                         {job.preprocessing_pipeline
@@ -763,14 +764,7 @@ function TrainingManage({ user, projectId }) {
                   </div>
 
                   <div className="progress-panel">
-                    <div className="progress-head">
-                      <span>Progress</span>
-                      <strong>{Math.round(displayProgress)}%</strong>
-                    </div>
-                    <div className="progress-track">
-                      <div className="progress-bar" style={{ width: `${displayProgress}%` }} />
-                    </div>
-                    <small>Epoch {displayEpoch} / {job.epochs || 0}</small>
+                    <ProgressMeter job={job} />
                   </div>
 
                   <div className="config-grid">
@@ -828,8 +822,8 @@ function TrainingManage({ user, projectId }) {
                     <span>Created {formatDate(job.created_at)}</span>
                     <div className="job-actions">
                       {isActive ? (
-                        <button type="button" onClick={() => stopJob(job)} disabled={job.status === "STOPPING"}>
-                          Stop
+                        <button type="button" onClick={() => stopJob(job)}>
+                          {isStopping ? "Force Stop" : "Stop"}
                         </button>
                       ) : (
                         <button type="button" onClick={() => startJob(job)}>
@@ -863,14 +857,6 @@ function TrainingManage({ user, projectId }) {
               </div>
 
               <div className="live-controls">
-                <label className="live-toggle">
-                  <input
-                    type="checkbox"
-                    checked={livePreviewEnabled}
-                    onChange={(event) => setLivePreviewEnabled(event.target.checked)}
-                  />
-                  실시간 결과 확인
-                </label>
                 <button type="button" onClick={() => loadPage(true)}>
                   Refresh
                 </button>
@@ -881,15 +867,27 @@ function TrainingManage({ user, projectId }) {
 
               {selectedJob ? (
                 <>
+                  <div className="live-section">
+                    <div className="live-section-title">
+                      <h3>Latest Logs</h3>
+                      <span>{selectedLogs.length} lines</span>
+                    </div>
+                    <div className="live-log-box">
+                      {selectedLogs.length === 0 ? (
+                        <p>아직 로그가 없습니다.</p>
+                      ) : (
+                        selectedLogs.slice(-12).map((log, index) => (
+                          <p key={`${log.time || "log"}-${index}`}>
+                            <span>{formatDate(log.time)}</span>
+                            {log.message}
+                          </p>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
                   <div className="live-progress-card">
-                    <div className="progress-head">
-                      <span>Progress</span>
-                      <strong>{Math.round(getDisplayProgress(selectedJob))}%</strong>
-                    </div>
-                    <div className="progress-track">
-                      <div className="progress-bar" style={{ width: `${getDisplayProgress(selectedJob)}%` }} />
-                    </div>
-                    <small>Epoch {getDisplayEpoch(selectedJob)} / {selectedJob.epochs || 0}</small>
+                    <ProgressMeter job={selectedJob} />
                   </div>
 
                   <TrainingMetricCards job={selectedJob} />
@@ -911,7 +909,7 @@ function TrainingManage({ user, projectId }) {
                         <small>{selectedJob.dataset?.original_filename || "-"}</small>
                       </div>
                       <div>
-                        <span>Preset</span>
+                        <span>Dataset Preprocessing</span>
                         <strong>{selectedJob.preprocessing_pipeline?.name || "None"}</strong>
                         <small>{selectedJob.preprocessing_pipeline?.source || "original"}</small>
                       </div>
@@ -985,18 +983,6 @@ function TrainingManage({ user, projectId }) {
 
                   <div className="live-section">
                     <div className="live-section-title">
-                      <h3>Tuning Suggestions</h3>
-                      <span>next run</span>
-                    </div>
-                    <ul className="tuning-list">
-                      {tuningSuggestions.map((item) => (
-                        <li key={item}>{item}</li>
-                      ))}
-                    </ul>
-                  </div>
-
-                  <div className="live-section">
-                    <div className="live-section-title">
                       <h3>Artifacts</h3>
                       <span>result paths</span>
                     </div>
@@ -1040,24 +1026,6 @@ function TrainingManage({ user, projectId }) {
                     </div>
                   )}
 
-                  <div className="live-section">
-                    <div className="live-section-title">
-                      <h3>Latest Logs</h3>
-                      <span>{selectedLogs.length} lines</span>
-                    </div>
-                    <div className="live-log-box">
-                      {selectedLogs.length === 0 ? (
-                        <p>아직 로그가 없습니다.</p>
-                      ) : (
-                        selectedLogs.slice(-10).map((log, index) => (
-                          <p key={`${log.time || "log"}-${index}`}>
-                            <span>{formatDate(log.time)}</span>
-                            {log.message}
-                          </p>
-                        ))
-                      )}
-                    </div>
-                  </div>
                 </>
               ) : (
                 <div className="live-empty-box">왼쪽에서 학습 작업을 선택하세요.</div>
@@ -1079,6 +1047,8 @@ function TrainingManage({ user, projectId }) {
                 Close
               </button>
             </div>
+
+            {error && <div className="training-error modal-message">{error}</div>}
 
             <div className="modal-body">
               <section className="modal-section">
@@ -1123,9 +1093,9 @@ function TrainingManage({ user, projectId }) {
                     </select>
                   </label>
                   <label className="field">
-                    <span>전처리 preset</span>
+                    <span>데이터셋 전처리</span>
                     <select name="preprocessing_pipeline_id" value={form.preprocessing_pipeline_id} onChange={handleChange}>
-                      <option value="">선택 안 함</option>
+                      <option value="">원본 데이터셋 사용</option>
                       {pipelineOptions.map((pipeline) => (
                         <option key={pipeline.id} value={pipeline.id}>
                           [{pipeline.source === "auto" ? "Auto" : "Manual"}] {pipeline.name} ({pipeline.image_size}px)
@@ -1228,6 +1198,8 @@ function TrainingManage({ user, projectId }) {
                 Close
               </button>
             </div>
+
+            {error && <div className="training-error modal-message">{error}</div>}
 
             <div className="modal-body">
               <section className="modal-section">

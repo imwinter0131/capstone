@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from "react";
 import Login from "./Login";
 import DatasetManage from "./DatasetManage";
-import PreprocessingManage from "./PreprocessingManage";
 import Projects from "./Projects";
 import TrainingManage from "./TrainingManage";
 
@@ -50,7 +49,7 @@ function App() {
     const projectId = pathParts[1];
 
     if (pathParts[2] === "preprocessing") {
-      return <PreprocessingManage user={user} projectId={projectId} />;
+      return <DatasetManage user={user} projectId={projectId} />;
     }
 
     if (pathParts[2] === "training") {
