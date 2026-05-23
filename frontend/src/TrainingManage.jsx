@@ -7,10 +7,17 @@ const fallbackModels = [
   { id: "yolov8n.pt", name: "YOLOv8 Nano", task: "detect", source: "builtin" },
   { id: "yolov8s.pt", name: "YOLOv8 Small", task: "detect", source: "builtin" },
   { id: "yolov8m.pt", name: "YOLOv8 Medium", task: "detect", source: "builtin" },
-  { id: "yolov8n-cls.pt", name: "YOLOv8 Nano CLS", task: "classify", source: "builtin" },
-  { id: "yolov8s-cls.pt", name: "YOLOv8 Small CLS", task: "classify", source: "builtin" },
-  { id: "yolov8m-cls.pt", name: "YOLOv8 Medium CLS", task: "classify", source: "builtin" },
+  { id: "yolov8l.pt", name: "YOLOv8 Large", task: "detect", source: "builtin" },
+  { id: "yolov8x.pt", name: "YOLOv8 XLarge", task: "detect", source: "builtin" },
+  { id: "convnext_tiny", name: "ConvNeXt Tiny", task: "classify", source: "builtin" },
+  { id: "convnext_small", name: "ConvNeXt Small", task: "classify", source: "builtin" },
+  { id: "convnext_base", name: "ConvNeXt Base", task: "classify", source: "builtin" },
 ];
+
+const defaultImageSizeByTask = {
+  detect: 640,
+  classify: 224,
+};
 
 const emptyForm = {
   name: "",
@@ -323,7 +330,7 @@ function TrainingManage({ user, projectId }) {
         fetch(`${API_BASE}/projects/${projectId}/training-jobs?user_id=${userId}`),
         fetch(`${API_BASE}/projects/${projectId}/datasets?user_id=${userId}`),
         fetch(`${API_BASE}/projects/${projectId}/preprocessing-pipelines?user_id=${userId}`),
-        fetch(`${API_BASE}/yolo-models?user_id=${userId}&project_id=${projectId}`),
+        fetch(`${API_BASE}/training-models?user_id=${userId}&project_id=${projectId}`),
       ]);
 
       const jobsData = await jobsResponse.json();
@@ -392,10 +399,14 @@ function TrainingManage({ user, projectId }) {
   }, [modelOptions, datasetOptions, pipelineOptions, form.yolo_model, form.dataset_id, form.preprocessing_pipeline_id]);
 
   function openCreateModal() {
+    const createTask = emptyForm.task_type;
+    const createModels = models.filter((model) => model.task === createTask);
+    const createDatasets = datasets.filter((dataset) => dataset.task_type === createTask);
     setForm({
       ...emptyForm,
-      dataset_id: datasetOptions[0] ? String(datasetOptions[0].id) : "",
-      yolo_model: modelOptions[0] ? modelOptions[0].id : emptyForm.yolo_model,
+      image_size: defaultImageSizeByTask[createTask] || emptyForm.image_size,
+      dataset_id: createDatasets[0] ? String(createDatasets[0].id) : "",
+      yolo_model: createModels[0] ? createModels[0].id : emptyForm.yolo_model,
     });
     setModalOpen(true);
     setError("");
@@ -457,10 +468,23 @@ function TrainingManage({ user, projectId }) {
       "momentum_max",
     ]);
 
-    setForm((prev) => ({
-      ...prev,
-      [name]: numericFields.has(name) ? Number(value) : value,
-    }));
+    setForm((prev) => {
+      if (name === "task_type") {
+        return {
+          ...prev,
+          task_type: value,
+          image_size: defaultImageSizeByTask[value] || prev.image_size,
+          yolo_model: "",
+          dataset_id: "",
+          preprocessing_pipeline_id: "",
+        };
+      }
+
+      return {
+        ...prev,
+        [name]: numericFields.has(name) ? Number(value) : value,
+      };
+    });
   }
 
   function handleModelChange(event) {
@@ -579,7 +603,12 @@ function TrainingManage({ user, projectId }) {
       }
 
       await loadPage(true);
-      setForm((prev) => ({ ...prev, task_type: data.model.task, yolo_model: data.model.id }));
+      setForm((prev) => ({
+        ...prev,
+        task_type: data.model.task,
+        yolo_model: data.model.id,
+        image_size: defaultImageSizeByTask[data.model.task] || prev.image_size,
+      }));
       closeModelModal();
     } catch {
       setError("서버와 연결할 수 없습니다. 백엔드 서버를 확인하세요.");
@@ -699,7 +728,7 @@ function TrainingManage({ user, projectId }) {
         <div className="side-panel">
           <span>Training Models</span>
           <strong>{models.length}</strong>
-          <p>기본 YOLO 모델과 직접 추가한 모델을 함께 사용합니다.</p>
+          <p>탐지 YOLO 모델, 분류 ConvNeXt 모델, 직접 추가한 모델을 함께 사용합니다.</p>
         </div>
       </aside>
 
@@ -769,7 +798,7 @@ function TrainingManage({ user, projectId }) {
 
                   <div className="config-grid">
                     <div>
-                      <span>YOLO Model</span>
+                      <span>Training Model</span>
                       <strong>{job.yolo_model}</strong>
                     </div>
                     <div>
@@ -1015,7 +1044,7 @@ function TrainingManage({ user, projectId }) {
                         ))}
                       </div>
                     ) : (
-                      <div className="live-empty-box">YOLO 결과 이미지가 생성되면 이곳에서 미리 볼 수 있습니다.</div>
+                      <div className="live-empty-box">학습 결과 이미지가 생성되면 이곳에서 미리 볼 수 있습니다.</div>
                     )}
                   </div>
 
@@ -1040,7 +1069,7 @@ function TrainingManage({ user, projectId }) {
           <form className="training-modal" onSubmit={handleSubmit}>
             <div className="modal-header">
               <div>
-                <p className="eyebrow">New YOLO Training</p>
+                <p className="eyebrow">New Training</p>
                 <h2>새 학습 생성</h2>
               </div>
               <button type="button" onClick={closeModal} disabled={saving}>
@@ -1110,7 +1139,7 @@ function TrainingManage({ user, projectId }) {
                 <h3>Training Config</h3>
                 <div className="form-grid">
                   <label className="field">
-                    <span>YOLO 모델</span>
+                    <span>학습 모델</span>
                     <div className="model-select-row">
                       <select name="yolo_model" value={form.yolo_model} onChange={handleChange}>
                         {modelOptions.map((model) => (
@@ -1228,7 +1257,7 @@ function TrainingManage({ user, projectId }) {
                   <label className="upload-zone wide">
                     <input type="file" name="model_file" accept=".pt,.pth,.onnx" onChange={handleModelChange} />
                     <strong>{modelForm.model_file ? modelForm.model_file.name : "모델 파일 선택"}</strong>
-                    <span>Ultralytics YOLO 학습에 사용할 .pt 파일을 권장합니다.</span>
+                    <span>탐지는 YOLO .pt, 분류는 ConvNeXt 계열 .pt 또는 .pth 파일을 권장합니다.</span>
                   </label>
                 </div>
               </section>

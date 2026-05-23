@@ -47,13 +47,15 @@ models.Base.metadata.create_all(bind=database.engine)
 # 비밀번호 암호화 설정
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-YOLO_MODELS = [
-    {"id": "yolov8n.pt", "name": "YOLOv8 Nano", "task": "detect", "description": "가볍고 빠른 탐지 모델", "source": "builtin"},
-    {"id": "yolov8s.pt", "name": "YOLOv8 Small", "task": "detect", "description": "속도와 정확도 균형형 탐지 모델", "source": "builtin"},
-    {"id": "yolov8m.pt", "name": "YOLOv8 Medium", "task": "detect", "description": "정확도 우선 탐지 모델", "source": "builtin"},
-    {"id": "yolov8n-cls.pt", "name": "YOLOv8 Nano CLS", "task": "classify", "description": "가벼운 분류 모델", "source": "builtin"},
-    {"id": "yolov8s-cls.pt", "name": "YOLOv8 Small CLS", "task": "classify", "description": "속도와 정확도 균형형 분류 모델", "source": "builtin"},
-    {"id": "yolov8m-cls.pt", "name": "YOLOv8 Medium CLS", "task": "classify", "description": "정확도 우선 분류 모델", "source": "builtin"},
+BUILTIN_TRAINING_MODELS = [
+    {"id": "yolov8n.pt", "name": "YOLOv8 Nano", "task": "detect", "description": "가볍고 빠른 YOLO 탐지 모델", "source": "builtin", "family": "YOLO"},
+    {"id": "yolov8s.pt", "name": "YOLOv8 Small", "task": "detect", "description": "속도와 정확도 균형형 YOLO 탐지 모델", "source": "builtin", "family": "YOLO"},
+    {"id": "yolov8m.pt", "name": "YOLOv8 Medium", "task": "detect", "description": "정확도 우선 YOLO 탐지 모델", "source": "builtin", "family": "YOLO"},
+    {"id": "yolov8l.pt", "name": "YOLOv8 Large", "task": "detect", "description": "대형 객체 탐지 실험용 YOLO 모델", "source": "builtin", "family": "YOLO"},
+    {"id": "yolov8x.pt", "name": "YOLOv8 XLarge", "task": "detect", "description": "가장 큰 YOLOv8 탐지 모델", "source": "builtin", "family": "YOLO"},
+    {"id": "convnext_tiny", "name": "ConvNeXt Tiny", "task": "classify", "description": "가볍고 빠른 ConvNeXt 분류 모델", "source": "builtin", "family": "ConvNeXt"},
+    {"id": "convnext_small", "name": "ConvNeXt Small", "task": "classify", "description": "속도와 정확도 균형형 ConvNeXt 분류 모델", "source": "builtin", "family": "ConvNeXt"},
+    {"id": "convnext_base", "name": "ConvNeXt Base", "task": "classify", "description": "정확도 우선 ConvNeXt 분류 모델", "source": "builtin", "family": "ConvNeXt"},
 ]
 
 ALLOWED_OPTIMIZERS = {"SGD", "Adam", "AdamW"}
@@ -335,7 +337,7 @@ def make_default_folder_path(user_id: int, project_name: str):
 
 
 def list_available_models(db: Session, user_id: Optional[int] = None, project_id: Optional[int] = None):
-    models_list = [dict(item) for item in YOLO_MODELS]
+    models_list = [dict(item) for item in BUILTIN_TRAINING_MODELS]
     if user_id is None:
         return models_list
 
@@ -354,7 +356,7 @@ def get_training_model_info(
     user_id: Optional[int] = None,
     project_id: Optional[int] = None,
 ):
-    for item in YOLO_MODELS:
+    for item in BUILTIN_TRAINING_MODELS:
         if item["id"] == model_id and item["task"] == task_type:
             return {**item, "model_path": item["id"]}
 
@@ -1171,6 +1173,210 @@ def write_training_runner(run_dir: Path, job: models.TrainingJob, model_path: st
     return runner_path
 
 
+def write_convnext_training_runner(run_dir: Path, job: models.TrainingJob, model_id: str, data_target: str):
+    runner_path = run_dir / "run_convnext_training.py"
+    convnext_run_dir = run_dir / "convnext"
+    runner_path.write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                "import copy",
+                "import csv",
+                "import torch",
+                "from torch import nn",
+                "from torch.utils.data import DataLoader",
+                "from torchvision import datasets, models, transforms",
+                "",
+                f"DATA_ROOT = Path({str(data_target)!r})",
+                f"RUN_DIR = Path({str(convnext_run_dir)!r})",
+                f"MODEL_ID = {model_id!r}",
+                f"TOTAL_EPOCHS = {int(job.epochs)}",
+                f"IMAGE_SIZE = {int(job.image_size)}",
+                f"BATCH_SIZE = {int(job.batch_min)}",
+                f"OPTIMIZER_NAME = {job.optimizer!r}",
+                f"LR = {float(job.lr_initial_min)}",
+                f"MOMENTUM = {float(job.momentum_min)}",
+                "_last_emitted_progress = -1.0",
+                "",
+                "RUN_DIR.mkdir(parents=True, exist_ok=True)",
+                "WEIGHTS_DIR = RUN_DIR / 'weights'",
+                "WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)",
+                "RESULTS_CSV = RUN_DIR / 'results.csv'",
+                "",
+                "def find_split(root, names):",
+                "    for name in names:",
+                "        candidate = root / name",
+                "        if candidate.exists() and candidate.is_dir():",
+                "            return candidate",
+                "    return None",
+                "",
+                "def emit_progress(epoch, batch=0, batches=0, progress=None, force=False):",
+                "    global _last_emitted_progress",
+                "    if progress is None:",
+                "        ratio = 1.0 if not batches else max(0.0, min(1.0, batch / batches))",
+                "        progress = (((epoch - 1) + ratio) / TOTAL_EPOCHS) * 100",
+                "    progress = max(0.0, min(100.0, float(progress)))",
+                "    if force or progress - _last_emitted_progress >= 0.25:",
+                "        print(f'DL_PROGRESS epoch={epoch} total={TOTAL_EPOCHS} batch={batch} batches={batches} progress={progress:.2f}', flush=True)",
+                "        _last_emitted_progress = progress",
+                "",
+                "def build_model(model_id, num_classes):",
+                "    builders = {",
+                "        'convnext_tiny': models.convnext_tiny,",
+                "        'convnext_small': models.convnext_small,",
+                "        'convnext_base': models.convnext_base,",
+                "    }",
+                "    builder = builders.get(model_id, models.convnext_tiny)",
+                "    try:",
+                "        model = builder(weights=None)",
+                "    except TypeError:",
+                "        model = builder(pretrained=False)",
+                "    in_features = model.classifier[-1].in_features",
+                "    model.classifier[-1] = nn.Linear(in_features, num_classes)",
+                "    if model_id not in builders and Path(model_id).exists():",
+                "        checkpoint = torch.load(model_id, map_location='cpu')",
+                "        state = checkpoint.get('model_state_dict') if isinstance(checkpoint, dict) else None",
+                "        if state is None and isinstance(checkpoint, dict):",
+                "            state = checkpoint.get('state_dict') or checkpoint",
+                "        if isinstance(state, dict):",
+                "            state = {key.replace('module.', '', 1): value for key, value in state.items()}",
+                "            current = model.state_dict()",
+                "            filtered = {key: value for key, value in state.items() if key in current and tuple(current[key].shape) == tuple(value.shape)}",
+                "            if filtered:",
+                "                model.load_state_dict(filtered, strict=False)",
+                "    return model",
+                "",
+                "def accuracy_topk(output, target, topk=(1, 5)):",
+                "    if output.numel() == 0:",
+                "        return [0.0 for _ in topk]",
+                "    max_k = min(max(topk), output.size(1))",
+                "    _, pred = output.topk(max_k, 1, True, True)",
+                "    pred = pred.t()",
+                "    correct = pred.eq(target.reshape(1, -1).expand_as(pred))",
+                "    scores = []",
+                "    for k in topk:",
+                "        actual_k = min(k, output.size(1))",
+                "        correct_k = correct[:actual_k].reshape(-1).float().sum(0).item()",
+                "        scores.append(correct_k / max(1, target.size(0)))",
+                "    return scores",
+                "",
+                "train_dir = find_split(DATA_ROOT, ['train', 'training'])",
+                "val_dir = find_split(DATA_ROOT, ['val', 'valid', 'validation'])",
+                "if train_dir is None:",
+                "    raise RuntimeError('Classification dataset must contain a train folder with class subfolders.')",
+                "if val_dir is None:",
+                "    val_dir = train_dir",
+                "",
+                "train_transform = transforms.Compose([",
+                "    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),",
+                "    transforms.RandomHorizontalFlip(),",
+                "    transforms.ToTensor(),",
+                "    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),",
+                "])",
+                "val_transform = transforms.Compose([",
+                "    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),",
+                "    transforms.ToTensor(),",
+                "    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),",
+                "])",
+                "",
+                "train_dataset = datasets.ImageFolder(str(train_dir), transform=train_transform)",
+                "val_dataset = datasets.ImageFolder(str(val_dir), transform=val_transform)",
+                "num_classes = max(1, len(train_dataset.classes))",
+                "batch_size = max(1, min(BATCH_SIZE, len(train_dataset)))",
+                "train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)",
+                "val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)",
+                "",
+                "device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')",
+                "model = build_model(MODEL_ID, num_classes).to(device)",
+                "criterion = nn.CrossEntropyLoss()",
+                "if OPTIMIZER_NAME == 'SGD':",
+                "    optimizer = torch.optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM)",
+                "elif OPTIMIZER_NAME == 'Adam':",
+                "    optimizer = torch.optim.Adam(model.parameters(), lr=LR)",
+                "else:",
+                "    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)",
+                "",
+                "print(f'ConvNeXt training model={MODEL_ID} classes={num_classes} train={len(train_dataset)} val={len(val_dataset)} device={device}', flush=True)",
+                "best_acc = -1.0",
+                "best_state = None",
+                "fieldnames = ['epoch', 'train_loss', 'val_loss', 'accuracy_top1', 'accuracy_top5']",
+                "rows = []",
+                "",
+                "for epoch in range(1, TOTAL_EPOCHS + 1):",
+                "    model.train()",
+                "    train_loss_sum = 0.0",
+                "    train_items = 0",
+                "    batches = max(1, len(train_loader))",
+                "    for batch_index, (images, targets) in enumerate(train_loader, start=1):",
+                "        images = images.to(device)",
+                "        targets = targets.to(device)",
+                "        optimizer.zero_grad(set_to_none=True)",
+                "        outputs = model(images)",
+                "        loss = criterion(outputs, targets)",
+                "        loss.backward()",
+                "        optimizer.step()",
+                "        train_loss_sum += loss.item() * images.size(0)",
+                "        train_items += images.size(0)",
+                "        emit_progress(epoch, batch_index, batches)",
+                "",
+                "    model.eval()",
+                "    val_loss_sum = 0.0",
+                "    val_items = 0",
+                "    top1_sum = 0.0",
+                "    top5_sum = 0.0",
+                "    with torch.no_grad():",
+                "        for images, targets in val_loader:",
+                "            images = images.to(device)",
+                "            targets = targets.to(device)",
+                "            outputs = model(images)",
+                "            loss = criterion(outputs, targets)",
+                "            top1, top5 = accuracy_topk(outputs, targets)",
+                "            val_loss_sum += loss.item() * images.size(0)",
+                "            val_items += images.size(0)",
+                "            top1_sum += top1 * images.size(0)",
+                "            top5_sum += top5 * images.size(0)",
+                "",
+                "    train_loss = train_loss_sum / max(1, train_items)",
+                "    val_loss = val_loss_sum / max(1, val_items)",
+                "    top1 = top1_sum / max(1, val_items)",
+                "    top5 = top5_sum / max(1, val_items)",
+                "    row = {'epoch': epoch, 'train_loss': round(train_loss, 6), 'val_loss': round(val_loss, 6), 'accuracy_top1': round(top1, 6), 'accuracy_top5': round(top5, 6)}",
+                "    rows.append(row)",
+                "    with RESULTS_CSV.open('w', encoding='utf-8', newline='') as handle:",
+                "        writer = csv.DictWriter(handle, fieldnames=fieldnames)",
+                "        writer.writeheader()",
+                "        writer.writerows(rows)",
+                "",
+                "    checkpoint = {'model_id': MODEL_ID, 'classes': train_dataset.classes, 'epoch': epoch, 'model_state_dict': model.state_dict()}",
+                "    torch.save(checkpoint, WEIGHTS_DIR / 'last.pt')",
+                "    if top1 >= best_acc:",
+                "        best_acc = top1",
+                "        best_state = copy.deepcopy(checkpoint)",
+                "        torch.save(best_state, WEIGHTS_DIR / 'best.pt')",
+                "",
+                "    print(f'Epoch {epoch}/{TOTAL_EPOCHS} train_loss={train_loss:.4f} val_loss={val_loss:.4f} top1={top1:.4f} top5={top5:.4f}', flush=True)",
+                "    emit_progress(epoch, progress=(epoch / TOTAL_EPOCHS) * 100, force=True)",
+                "",
+                "try:",
+                "    import matplotlib.pyplot as plt",
+                "    epochs = [item['epoch'] for item in rows]",
+                "    plt.figure(figsize=(8, 4))",
+                "    plt.plot(epochs, [item['accuracy_top1'] for item in rows], label='Top-1 Acc')",
+                "    plt.plot(epochs, [item['val_loss'] for item in rows], label='Val Loss')",
+                "    plt.xlabel('Epoch')",
+                "    plt.legend()",
+                "    plt.tight_layout()",
+                "    plt.savefig(RUN_DIR / 'results.png')",
+                "    plt.close()",
+                "except Exception:",
+                "    pass",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return runner_path
+
+
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -1283,7 +1489,7 @@ def run_simulated_training(db: Session, job: models.TrainingJob, stop_event: thr
         "run_dir": job.run_dir,
         "best_model_path": str(Path(job.run_dir or "") / "weights" / "best.pt"),
         "last_model_path": str(Path(job.run_dir or "") / "weights" / "last.pt"),
-        "message": "ultralytics 실행 환경이 없거나 시뮬레이션으로 실행되어 결과 파일은 생성되지 않았습니다.",
+        "message": "실제 학습 실행 환경이 없거나 시뮬레이션으로 실행되어 결과 파일은 생성되지 않았습니다.",
     }
     metrics, epoch_metrics = build_simulated_result_metrics(job)
     result["metrics"] = metrics
@@ -1429,6 +1635,141 @@ def run_ultralytics_training(
             db.commit()
 
 
+def run_convnext_training(
+    db: Session,
+    job: models.TrainingJob,
+    model_id: str,
+    data_target: str,
+    stop_event: threading.Event,
+):
+    run_dir = Path(job.run_dir)
+    runner_path = write_convnext_training_runner(run_dir, job, model_id, data_target)
+    append_training_log(db, job, "torchvision 기반 ConvNeXt 분류 학습 프로세스를 시작합니다.")
+
+    process = subprocess.Popen(
+        [sys.executable, "-u", str(runner_path)],
+        cwd=str(run_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    TRAINING_PROCESSES[job.id] = process
+    output_queue = Queue()
+    reader_thread = threading.Thread(
+        target=enqueue_training_output,
+        args=(process.stdout, output_queue),
+        daemon=True,
+    )
+    reader_thread.start()
+
+    total_epochs = max(1, int(job.epochs or 1))
+    last_progress = max(1, float(job.progress or 0))
+    last_epoch = clamp_epoch_value(job.current_epoch, total_epochs)
+    last_progress_log = -1.0
+    last_progress_log_epoch = -1
+    last_progress_update_at = 0.0
+    reader_done = False
+    terminate_requested = False
+    update_training_progress(db, job, status="RUNNING", progress=last_progress)
+
+    try:
+        while True:
+            if stop_event.is_set() and not terminate_requested:
+                stop_training_process(job.id, wait_timeout=0.5)
+                terminate_requested = True
+                append_training_log(db, job, "ConvNeXt 학습 프로세스 종료 요청을 보냈습니다.")
+
+            line = ""
+            try:
+                item = output_queue.get(timeout=0.2)
+                if item is None:
+                    reader_done = True
+                else:
+                    line = item
+            except Empty:
+                pass
+
+            if line:
+                progress_info = parse_tqdm_training_progress(line, total_epochs, last_epoch)
+                if progress_info:
+                    current_epoch = max(last_epoch, progress_info["epoch"])
+                    next_progress = max(last_progress, progress_info["progress"])
+                    now = time.monotonic()
+
+                    should_update = (
+                        current_epoch > last_epoch
+                        or next_progress - last_progress >= 0.35
+                        or now - last_progress_update_at >= 1.0
+                    )
+                    if should_update:
+                        last_epoch = current_epoch
+                        last_progress = next_progress
+                        last_progress_update_at = now
+                        update_training_progress(
+                            db,
+                            job,
+                            status="RUNNING",
+                            progress=last_progress,
+                            current_epoch=last_epoch,
+                        )
+
+                    should_log_progress = (
+                        current_epoch > last_progress_log_epoch
+                        or last_progress - last_progress_log >= 5
+                        or last_progress >= 99
+                    )
+                    if should_log_progress:
+                        append_training_log(db, job, progress_info["log"])
+                        last_progress_log = last_progress
+                        last_progress_log_epoch = current_epoch
+                else:
+                    append_training_log(db, job, line)
+
+            if process.poll() is not None:
+                if reader_done or output_queue.empty():
+                    break
+
+            if not line:
+                db.refresh(job)
+                if job.stop_requested:
+                    stop_event.set()
+                    stop_training_process(job.id, wait_timeout=0.5)
+
+        return_code = process.wait()
+        if stop_event.is_set():
+            mark_training_stopped(db, job, message="ConvNeXt 학습이 중지되었습니다.")
+            return
+
+        weights_dir = run_dir / "convnext" / "weights"
+        result = {
+            "mode": "convnext",
+            "run_dir": str(run_dir / "convnext"),
+            "best_model_path": str(weights_dir / "best.pt"),
+            "last_model_path": str(weights_dir / "last.pt"),
+            "return_code": return_code,
+        }
+        if return_code == 0:
+            epoch_metrics = load_epoch_metrics_from_results_csv(result["run_dir"])
+            result["epoch_metrics"] = epoch_metrics
+            result["metrics"] = summarize_epoch_metrics(epoch_metrics)
+            update_training_progress(db, job, status="COMPLETED", progress=100, current_epoch=job.epochs, result=result)
+            append_training_log(db, job, "ConvNeXt 분류 학습이 완료되었습니다.")
+        else:
+            result["message"] = "ConvNeXt 분류 학습 프로세스가 실패했습니다."
+            update_training_progress(db, job, status="FAILED", result=result)
+            append_training_log(db, job, "ConvNeXt 분류 학습이 실패했습니다.")
+    finally:
+        TRAINING_PROCESSES.pop(job.id, None)
+        if job.status == "STOPPING":
+            mark_training_stopped(db, job, message="학습 중지 상태를 정리했습니다.")
+        elif job.status in {"COMPLETED", "FAILED", "STOPPED"}:
+            job.completed_at = job.completed_at or datetime.utcnow()
+            db.commit()
+
+
 def training_worker(job_id: int, simulate: bool = False):
     db = database.SessionLocal()
     stop_event = TRAINING_STOP_EVENTS.setdefault(job_id, threading.Event())
@@ -1470,7 +1811,7 @@ def training_worker(job_id: int, simulate: bool = False):
         append_training_log(db, job, f"데이터셋 압축 해제 완료: {dataset_dir}")
 
         data_config = find_first_dataset_config(dataset_dir)
-        data_target = str(data_config or dataset_dir)
+        data_target = str(dataset_dir if job.task_type == "classify" else data_config or dataset_dir)
         if job.task_type == "detect" and not data_config:
             append_training_log(db, job, "data.yaml을 찾지 못해 실제 탐지 학습 대신 시뮬레이션으로 전환합니다.")
             simulate = True
@@ -1480,12 +1821,24 @@ def training_worker(job_id: int, simulate: bool = False):
             raise RuntimeError("학습 모델 정보를 찾을 수 없습니다.")
         model_path = model_info.get("model_path") or model_info["id"]
 
-        if simulate or importlib.util.find_spec("ultralytics") is None:
-            if not simulate:
-                append_training_log(db, job, "ultralytics 패키지를 찾지 못해 시뮬레이션으로 전환합니다.")
-            run_simulated_training(db, job, stop_event)
+        if job.task_type == "classify":
+            has_convnext_runtime = (
+                importlib.util.find_spec("torch") is not None
+                and importlib.util.find_spec("torchvision") is not None
+            )
+            if simulate or not has_convnext_runtime:
+                if not simulate:
+                    append_training_log(db, job, "torch/torchvision 패키지를 찾지 못해 시뮬레이션으로 전환합니다.")
+                run_simulated_training(db, job, stop_event)
+            else:
+                run_convnext_training(db, job, model_path, data_target, stop_event)
         else:
-            run_ultralytics_training(db, job, model_path, data_target, stop_event)
+            if simulate or importlib.util.find_spec("ultralytics") is None:
+                if not simulate:
+                    append_training_log(db, job, "ultralytics 패키지를 찾지 못해 시뮬레이션으로 전환합니다.")
+                run_simulated_training(db, job, stop_event)
+            else:
+                run_ultralytics_training(db, job, model_path, data_target, stop_event)
     except Exception as exc:
         job = db.query(models.TrainingJob).filter(models.TrainingJob.id == job_id).first()
         if job:
@@ -1747,13 +2100,22 @@ def delete_project(
     }
 
 
+@app.get("/training-models")
+def list_training_models(
+    user_id: Optional[int] = Query(default=None),
+    project_id: Optional[int] = Query(default=None),
+    db: Session = Depends(database.get_db),
+):
+    return {"models": list_available_models(db, user_id, project_id)}
+
+
 @app.get("/yolo-models")
 def list_yolo_models(
     user_id: Optional[int] = Query(default=None),
     project_id: Optional[int] = Query(default=None),
     db: Session = Depends(database.get_db),
 ):
-    return {"models": list_available_models(db, user_id, project_id)}
+    return list_training_models(user_id, project_id, db)
 
 
 @app.post("/projects/{project_id}/training-models")
@@ -2356,7 +2718,7 @@ def create_training_job(
             raise HTTPException(status_code=400, detail="선택한 전처리 파이프라인의 작업 유형과 학습 작업 유형이 다릅니다.")
 
     if not model_supports_task(db, payload.yolo_model, task_type, payload.user_id, project_id):
-        raise HTTPException(status_code=400, detail="선택한 YOLO 모델이 작업 유형과 맞지 않습니다.")
+        raise HTTPException(status_code=400, detail="선택한 학습 모델이 작업 유형과 맞지 않습니다.")
     if payload.optimizer not in ALLOWED_OPTIMIZERS:
         raise HTTPException(status_code=400, detail="지원하지 않는 optimizer입니다.")
     if payload.image_size < 64 or payload.image_size > 2048:
