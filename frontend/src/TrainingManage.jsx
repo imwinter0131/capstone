@@ -50,10 +50,17 @@ const metricLabels = {
   precision: "Precision",
   recall: "Recall",
   f1: "F1",
+  train_acc: "Train Acc",
+  val_acc: "Val Acc",
   accuracy_top1: "Top-1 Acc",
   accuracy_top5: "Top-5 Acc",
   train_loss: "Train Loss",
   val_loss: "Val Loss",
+};
+
+const metricCardKeysByTask = {
+  detect: ["map50_95", "map50", "precision", "recall"],
+  classify: ["train_acc", "val_acc", "train_loss", "val_loss"],
 };
 
 const artifactItems = [
@@ -160,6 +167,7 @@ function ProgressMeter({ job }) {
 function getPrimaryMetricKey(job) {
   const metrics = job?.result?.metrics || {};
   if (job?.task_type === "classify") {
+    if (metrics.val_acc !== undefined) return "val_acc";
     return metrics.accuracy_top1 !== undefined ? "accuracy_top1" : "f1";
   }
   return metrics.map50_95 !== undefined ? "map50_95" : metrics.map50 !== undefined ? "map50" : "f1";
@@ -183,22 +191,26 @@ function artifactImageUrl(projectId, userId, path) {
   return `${API_BASE}/projects/${projectId}/artifact-file?user_id=${userId}&path=${encodeURIComponent(path)}`;
 }
 
+function getMetricValue(metrics, key) {
+  if (key === "val_acc") return metrics.val_acc ?? metrics.accuracy_top1;
+  return metrics[key];
+}
+
 function TrainingMetricCards({ job }) {
   const metrics = job?.result?.metrics || {};
-  const keys = ["map50_95", "map50", "precision", "recall", "f1", "accuracy_top1", "accuracy_top5", "train_loss", "val_loss"].filter(
-    (key) => metrics[key] !== undefined,
-  );
+  const metricKeys = metricCardKeysByTask[job?.task_type] || metricCardKeysByTask.detect;
+  const hasAnyMetric = metricKeys.some((key) => getMetricValue(metrics, key) !== undefined);
 
-  if (!keys.length) {
+  if (!hasAnyMetric) {
     return <div className="live-empty-box">아직 표시할 성능 지표가 없습니다.</div>;
   }
 
   return (
     <div className="live-metric-grid">
-      {keys.map((key) => (
+      {metricKeys.map((key) => (
         <div key={key}>
           <span>{metricLabels[key] || key}</span>
-          <strong>{formatMetric(metrics[key], key.includes("loss"))}</strong>
+          <strong>{formatMetric(getMetricValue(metrics, key), key.includes("loss"))}</strong>
         </div>
       ))}
     </div>
@@ -269,6 +281,7 @@ function TrainingManage({ user, projectId }) {
   const [modelSaving, setModelSaving] = useState(false);
   const [expandedLogs, setExpandedLogs] = useState({});
   const [selectedJobId, setSelectedJobId] = useState("");
+  const [selectedPreviewKey, setSelectedPreviewKey] = useState("");
 
   const userId = user?.user_id;
   const userEmail = user?.email || "user";
@@ -319,6 +332,18 @@ function TrainingManage({ user, projectId }) {
       exists: selectedArtifacts?.exists?.[key],
     }))
     .filter((item) => item.path && item.exists !== false);
+
+  useEffect(() => {
+    if (previewArtifacts.length === 0) {
+      setSelectedPreviewKey("");
+      return;
+    }
+
+    setSelectedPreviewKey((prev) => {
+      if (previewArtifacts.some((item) => item.key === prev)) return prev;
+      return previewArtifacts[0].key;
+    });
+  }, [selectedJob?.id, previewArtifacts.map((item) => item.key).join("|")]);
 
   async function loadPage(silent = false) {
     if (!projectId || !userId) return;
@@ -836,7 +861,7 @@ function TrainingManage({ user, projectId }) {
                         {logs.length === 0 ? (
                           <p>아직 로그가 없습니다.</p>
                         ) : (
-                          logs.slice(-12).map((log) => (
+                          logs.map((log) => (
                             <p key={`${log.time}-${log.message}`}>
                               <span>{formatDate(log.time)}</span>
                               {log.message}
@@ -898,14 +923,14 @@ function TrainingManage({ user, projectId }) {
                 <>
                   <div className="live-section">
                     <div className="live-section-title">
-                      <h3>Latest Logs</h3>
+                      <h3>Training Logs</h3>
                       <span>{selectedLogs.length} lines</span>
                     </div>
                     <div className="live-log-box">
                       {selectedLogs.length === 0 ? (
                         <p>아직 로그가 없습니다.</p>
                       ) : (
-                        selectedLogs.slice(-12).map((log, index) => (
+                        selectedLogs.map((log, index) => (
                           <p key={`${log.time || "log"}-${index}`}>
                             <span>{formatDate(log.time)}</span>
                             {log.message}
@@ -980,6 +1005,36 @@ function TrainingManage({ user, projectId }) {
 
                   <div className="live-section">
                     <div className="live-section-title">
+                      <h3>Result Images</h3>
+                      <span>{previewArtifacts.length} previews</span>
+                    </div>
+                    {previewArtifacts.length > 0 ? (
+                      <div className="artifact-preview-list">
+                        {previewArtifacts.map((item) => {
+                          const isSelected = selectedPreviewKey === item.key;
+
+                          return (
+                            <section className={`artifact-preview-item ${isSelected ? "selected" : ""}`} key={item.key}>
+                              <button type="button" onClick={() => setSelectedPreviewKey(item.key)}>
+                                <span>{item.label}</span>
+                              </button>
+                              {isSelected && (
+                                <figure>
+                                  <img src={artifactImageUrl(projectId, userId, item.path)} alt={`${item.label} preview`} />
+                                  <figcaption>{item.label}</figcaption>
+                                </figure>
+                              )}
+                            </section>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div className="live-empty-box">학습 결과 이미지가 생성되면 이곳에서 미리 볼 수 있습니다.</div>
+                    )}
+                  </div>
+
+                  <div className="live-section">
+                    <div className="live-section-title">
                       <h3>Epoch Trend</h3>
                       <span>{selectedResult.epoch_metrics?.length || 0} epochs</span>
                     </div>
@@ -1027,25 +1082,6 @@ function TrainingManage({ user, projectId }) {
                         );
                       })}
                     </div>
-                  </div>
-
-                  <div className="live-section">
-                    <div className="live-section-title">
-                      <h3>Result Images</h3>
-                      <span>{previewArtifacts.length} previews</span>
-                    </div>
-                    {previewArtifacts.length > 0 ? (
-                      <div className="artifact-preview-grid">
-                        {previewArtifacts.map((item) => (
-                          <figure key={item.key}>
-                            <img src={artifactImageUrl(projectId, userId, item.path)} alt={`${item.label} preview`} />
-                            <figcaption>{item.label}</figcaption>
-                          </figure>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="live-empty-box">학습 결과 이미지가 생성되면 이곳에서 미리 볼 수 있습니다.</div>
-                    )}
                   </div>
 
                   {selectedResult.error && (

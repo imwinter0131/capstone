@@ -757,6 +757,10 @@ def normalize_metric_key(key: str):
         "map50_95_b": "map50_95",
         "precision_b": "precision",
         "recall_b": "recall",
+        "train_acc": "train_acc",
+        "val_acc": "val_acc",
+        "train_accuracy": "train_acc",
+        "val_accuracy": "val_acc",
         "accuracy_top1": "accuracy_top1",
         "accuracy_top5": "accuracy_top5",
         "train_box_loss": "train_loss",
@@ -810,6 +814,8 @@ def summarize_epoch_metrics(epoch_metrics):
         "recall",
         "map50",
         "map50_95",
+        "train_acc",
+        "val_acc",
         "accuracy_top1",
         "accuracy_top5",
         "train_loss",
@@ -843,9 +849,12 @@ def build_simulated_result_metrics(job: models.TrainingJob):
             "val_loss": max(0.2, val_loss),
         }
         if job.task_type == "classify":
+            val_acc = round(0.48 + ratio * (final_acc - 0.48), 4)
             item.update(
                 {
-                    "accuracy_top1": round(0.48 + ratio * (final_acc - 0.48), 4),
+                    "train_acc": round(min(0.995, val_acc + 0.035), 4),
+                    "val_acc": val_acc,
+                    "accuracy_top1": val_acc,
                     "accuracy_top5": round(min(0.995, 0.72 + ratio * 0.24), 4),
                     "f1": round(0.46 + ratio * (final_precision - 0.46), 4),
                 }
@@ -880,6 +889,12 @@ def ensure_result_metrics(job: models.TrainingJob, result: Dict[str, Any]):
         metrics = summarize_epoch_metrics(epoch_metrics)
     if not metrics and result.get("mode") == "simulated":
         metrics, epoch_metrics = build_simulated_result_metrics(job)
+    if job.task_type == "classify":
+        if "val_acc" not in metrics and metrics.get("accuracy_top1") is not None:
+            metrics["val_acc"] = metrics["accuracy_top1"]
+        for row in epoch_metrics:
+            if isinstance(row, dict) and "val_acc" not in row and row.get("accuracy_top1") is not None:
+                row["val_acc"] = row["accuracy_top1"]
 
     return metrics, epoch_metrics
 
@@ -888,7 +903,7 @@ def get_primary_score(job: models.TrainingJob, metrics: Dict[str, Any]):
     if job.status != "COMPLETED":
         return None
     if job.task_type == "classify":
-        return first_metric_value(metrics, "accuracy_top1", "f1", "accuracy_top5")
+        return first_metric_value(metrics, "val_acc", "accuracy_top1", "f1", "accuracy_top5")
     return first_metric_value(metrics, "map50_95", "map50", "f1", "precision")
 
 
@@ -978,7 +993,7 @@ def append_training_log(db: Session, job: models.TrainingJob, message: str):
             "message": message,
         }
     )
-    job.logs_json = json.dumps(logs[-500:], ensure_ascii=False)
+    job.logs_json = json.dumps(logs, ensure_ascii=False)
     job.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(job)
@@ -1299,13 +1314,14 @@ def write_convnext_training_runner(run_dir: Path, job: models.TrainingJob, model
                 "print(f'ConvNeXt training model={MODEL_ID} classes={num_classes} train={len(train_dataset)} val={len(val_dataset)} device={device}', flush=True)",
                 "best_acc = -1.0",
                 "best_state = None",
-                "fieldnames = ['epoch', 'train_loss', 'val_loss', 'accuracy_top1', 'accuracy_top5']",
+                "fieldnames = ['epoch', 'train_acc', 'val_acc', 'train_loss', 'val_loss', 'accuracy_top1', 'accuracy_top5']",
                 "rows = []",
                 "",
                 "for epoch in range(1, TOTAL_EPOCHS + 1):",
                 "    model.train()",
                 "    train_loss_sum = 0.0",
                 "    train_items = 0",
+                "    train_acc_sum = 0.0",
                 "    batches = max(1, len(train_loader))",
                 "    for batch_index, (images, targets) in enumerate(train_loader, start=1):",
                 "        images = images.to(device)",
@@ -1315,8 +1331,10 @@ def write_convnext_training_runner(run_dir: Path, job: models.TrainingJob, model
                 "        loss = criterion(outputs, targets)",
                 "        loss.backward()",
                 "        optimizer.step()",
+                "        train_top1, _ = accuracy_topk(outputs.detach(), targets)",
                 "        train_loss_sum += loss.item() * images.size(0)",
                 "        train_items += images.size(0)",
+                "        train_acc_sum += train_top1 * images.size(0)",
                 "        emit_progress(epoch, batch_index, batches)",
                 "",
                 "    model.eval()",
@@ -1337,10 +1355,11 @@ def write_convnext_training_runner(run_dir: Path, job: models.TrainingJob, model
                 "            top5_sum += top5 * images.size(0)",
                 "",
                 "    train_loss = train_loss_sum / max(1, train_items)",
+                "    train_acc = train_acc_sum / max(1, train_items)",
                 "    val_loss = val_loss_sum / max(1, val_items)",
                 "    top1 = top1_sum / max(1, val_items)",
                 "    top5 = top5_sum / max(1, val_items)",
-                "    row = {'epoch': epoch, 'train_loss': round(train_loss, 6), 'val_loss': round(val_loss, 6), 'accuracy_top1': round(top1, 6), 'accuracy_top5': round(top5, 6)}",
+                "    row = {'epoch': epoch, 'train_acc': round(train_acc, 6), 'val_acc': round(top1, 6), 'train_loss': round(train_loss, 6), 'val_loss': round(val_loss, 6), 'accuracy_top1': round(top1, 6), 'accuracy_top5': round(top5, 6)}",
                 "    rows.append(row)",
                 "    with RESULTS_CSV.open('w', encoding='utf-8', newline='') as handle:",
                 "        writer = csv.DictWriter(handle, fieldnames=fieldnames)",
@@ -1354,14 +1373,14 @@ def write_convnext_training_runner(run_dir: Path, job: models.TrainingJob, model
                 "        best_state = copy.deepcopy(checkpoint)",
                 "        torch.save(best_state, WEIGHTS_DIR / 'best.pt')",
                 "",
-                "    print(f'Epoch {epoch}/{TOTAL_EPOCHS} train_loss={train_loss:.4f} val_loss={val_loss:.4f} top1={top1:.4f} top5={top5:.4f}', flush=True)",
+                "    print(f'Epoch {epoch}/{TOTAL_EPOCHS} train_acc={train_acc:.4f} val_acc={top1:.4f} train_loss={train_loss:.4f} val_loss={val_loss:.4f}', flush=True)",
                 "    emit_progress(epoch, progress=(epoch / TOTAL_EPOCHS) * 100, force=True)",
                 "",
                 "try:",
                 "    import matplotlib.pyplot as plt",
                 "    epochs = [item['epoch'] for item in rows]",
                 "    plt.figure(figsize=(8, 4))",
-                "    plt.plot(epochs, [item['accuracy_top1'] for item in rows], label='Top-1 Acc')",
+                "    plt.plot(epochs, [item['val_acc'] for item in rows], label='Val Acc')",
                 "    plt.plot(epochs, [item['val_loss'] for item in rows], label='Val Loss')",
                 "    plt.xlabel('Epoch')",
                 "    plt.legend()",
