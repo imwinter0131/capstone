@@ -1,10 +1,13 @@
+import os
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# 본인의 PostgreSQL 비밀번호와 DB 이름에 맞게 수정하세요.
-SQLALCHEMY_DATABASE_URL = "postgresql://postgres:0101@localhost/DLops"
+# DATABASE_URL을 지정하지 않으면 로컬 SQLite를 기본으로 사용합니다.
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dlops.db")
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+engine_kwargs = {"connect_args": {"check_same_thread": False}} if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(SQLALCHEMY_DATABASE_URL, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

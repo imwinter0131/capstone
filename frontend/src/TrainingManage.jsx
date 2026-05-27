@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import "./TrainingManage.css";
 
 const API_BASE = "http://localhost:8000";
@@ -269,6 +269,7 @@ function TrainingManage({ user, projectId }) {
   const [modelSaving, setModelSaving] = useState(false);
   const [expandedLogs, setExpandedLogs] = useState({});
   const [selectedJobId, setSelectedJobId] = useState("");
+  const liveLogBoxRef = useRef(null);
 
   const userId = user?.user_id;
   const userEmail = user?.email || "user";
@@ -381,6 +382,14 @@ function TrainingManage({ user, projectId }) {
     const timer = window.setInterval(() => loadPage(true), 600);
     return () => window.clearInterval(timer);
   }, [hasActiveJob, projectId, userId]);
+
+  useEffect(() => {
+    if (!selectedJob) return;
+    if (!["QUEUED", "RUNNING", "STOPPING"].includes(selectedJob.status)) return;
+    const node = liveLogBoxRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [selectedJob?.id, selectedJob?.status, selectedLogs.length]);
 
   useEffect(() => {
     const compatibleModel = modelOptions.some((model) => model.id === form.yolo_model);
@@ -836,8 +845,8 @@ function TrainingManage({ user, projectId }) {
                         {logs.length === 0 ? (
                           <p>아직 로그가 없습니다.</p>
                         ) : (
-                          logs.slice(-12).map((log) => (
-                            <p key={`${log.time}-${log.message}`}>
+                          logs.map((log, index) => (
+                            <p key={`${log.time || "log"}-${index}`}>
                               <span>{formatDate(log.time)}</span>
                               {log.message}
                             </p>
@@ -901,11 +910,11 @@ function TrainingManage({ user, projectId }) {
                       <h3>Latest Logs</h3>
                       <span>{selectedLogs.length} lines</span>
                     </div>
-                    <div className="live-log-box">
+                    <div className="live-log-box" ref={liveLogBoxRef}>
                       {selectedLogs.length === 0 ? (
                         <p>아직 로그가 없습니다.</p>
                       ) : (
-                        selectedLogs.slice(-12).map((log, index) => (
+                        selectedLogs.map((log, index) => (
                           <p key={`${log.time || "log"}-${index}`}>
                             <span>{formatDate(log.time)}</span>
                             {log.message}

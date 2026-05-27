@@ -2,6 +2,7 @@ from datetime import datetime
 import csv
 import importlib.util
 import json
+import os
 from pathlib import Path
 from queue import Empty, Queue
 import re
@@ -33,7 +34,7 @@ app = FastAPI(title="DLOps Backend")
 # React 개발 서버에서 오는 요청 허용
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -78,6 +79,9 @@ TRAINING_THREADS: Dict[int, threading.Thread] = {}
 TRAINING_STOP_EVENTS: Dict[int, threading.Event] = {}
 TRAINING_PROCESSES: Dict[int, subprocess.Popen] = {}
 STOPPING_STALE_SECONDS = 8.0
+
+
+WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 class UserAuth(BaseModel):
@@ -1095,6 +1099,73 @@ def find_first_dataset_config(dataset_dir: Path):
     return candidates[0] if candidates else None
 
 
+def to_local_path(path_like: str) -> Path:
+    """Normalize persisted path strings so they are valid in the current runtime."""
+    raw = (path_like or "").strip()
+    if not raw:
+        return Path(".").resolve()
+
+    # Convert Windows drive path (e.g. C:\foo or C:/foo) based on runtime OS.
+    if WINDOWS_DRIVE_PATH_RE.match(raw):
+        normalized = raw.replace("\\", "/")
+        if os.name == "nt":
+            return Path(normalized)
+        drive = normalized[0].lower()
+        tail = normalized[2:].lstrip("/")
+        return Path("/mnt") / drive / tail
+
+    return Path(raw)
+
+
+def resolve_existing_path(path_like: str, base_dir: Optional[Path] = None) -> Path:
+    """
+    Resolve persisted paths across Windows/WSL/Linux migrations.
+    Prefer paths that actually exist on disk.
+    """
+    raw = (path_like or "").strip()
+    if not raw:
+        return to_local_path(raw)
+
+    candidates: List[Path] = []
+    normalized = to_local_path(raw)
+    candidates.append(normalized)
+    candidates.append(Path(raw))
+
+    if base_dir is not None:
+        base = base_dir.resolve()
+        candidates.append(base / raw)
+
+    project_root = Path(__file__).resolve().parent
+    candidates.append(project_root / raw)
+
+    seen = set()
+    unique_candidates: List[Path] = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_candidates.append(candidate)
+
+    for candidate in unique_candidates:
+        if candidate.exists():
+            return candidate
+
+    return normalized
+
+
+def normalize_model_reference(model_ref: str) -> str:
+    """Convert model filesystem references to local runtime paths, keep model IDs as-is."""
+    value = (model_ref or "").strip()
+    if not value:
+        return value
+
+    if WINDOWS_DRIVE_PATH_RE.match(value) or value.startswith(("/", "./", "../")):
+        return str(resolve_existing_path(value))
+
+    return value
+
+
 def extract_dataset_zip(zip_path: Path, target_dir: Path):
     if target_dir.exists():
         shutil.rmtree(target_dir, ignore_errors=True)
@@ -1507,7 +1578,7 @@ def run_ultralytics_training(
     data_target: str,
     stop_event: threading.Event,
 ):
-    run_dir = Path(job.run_dir)
+    run_dir = to_local_path(job.run_dir).resolve()
     runner_path = write_training_runner(run_dir, job, model_path, data_target)
     append_training_log(db, job, "ultralytics 기반 YOLO 학습 프로세스를 시작합니다.")
 
@@ -1642,7 +1713,7 @@ def run_convnext_training(
     data_target: str,
     stop_event: threading.Event,
 ):
-    run_dir = Path(job.run_dir)
+    run_dir = to_local_path(job.run_dir).resolve()
     runner_path = write_convnext_training_runner(run_dir, job, model_id, data_target)
     append_training_log(db, job, "torchvision 기반 ConvNeXt 분류 학습 프로세스를 시작합니다.")
 
@@ -1784,7 +1855,8 @@ def training_worker(job_id: int, simulate: bool = False):
         if job.preprocessing_pipeline_id:
             pipeline = db.query(models.PreprocessingPipeline).filter(models.PreprocessingPipeline.id == job.preprocessing_pipeline_id).first()
 
-        run_dir = Path(project.folder_path) / "runs" / f"{make_safe_folder_name(job.name)}_{job.id}"
+        project_root = to_local_path(project.folder_path).resolve()
+        run_dir = project_root / "runs" / f"{make_safe_folder_name(job.name)}_{job.id}"
         dataset_dir = run_dir / "dataset"
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1807,7 +1879,8 @@ def training_worker(job_id: int, simulate: bool = False):
         if not dataset:
             raise RuntimeError("연결된 데이터셋을 찾을 수 없습니다.")
 
-        extract_dataset_zip(Path(dataset.zip_path), dataset_dir)
+        dataset_zip_path = resolve_existing_path(dataset.zip_path)
+        extract_dataset_zip(dataset_zip_path, dataset_dir)
         append_training_log(db, job, f"데이터셋 압축 해제 완료: {dataset_dir}")
 
         data_config = find_first_dataset_config(dataset_dir)
@@ -1820,6 +1893,7 @@ def training_worker(job_id: int, simulate: bool = False):
         if not model_info:
             raise RuntimeError("학습 모델 정보를 찾을 수 없습니다.")
         model_path = model_info.get("model_path") or model_info["id"]
+        model_path = normalize_model_reference(model_path)
 
         if job.task_type == "classify":
             has_convnext_runtime = (
