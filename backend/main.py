@@ -63,6 +63,8 @@ ALLOWED_TASKS = {"detect", "classify"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 LABEL_EXTENSIONS = {".txt"}
 ALLOWED_NORMALIZATIONS = {"none", "zero_one", "imagenet"}
+RESULTS_PLOT_STYLE_VERSION = "line-only-v1"
+CONFUSION_MATRIX_STYLE_VERSION = "theme-split-v1"
 DEFAULT_AUGMENTATIONS = {
     "horizontal_flip": True,
     "vertical_flip": False,
@@ -234,6 +236,10 @@ def serialize_training_job(
             "metrics": metrics,
             "epoch_metrics": epoch_metrics,
         }
+        if "ensure_stringit_results_plot" in globals():
+            ensure_stringit_results_plot(job, result, epoch_metrics)
+        if "ensure_stringit_confusion_matrix" in globals():
+            ensure_stringit_confusion_matrix(job, result)
     if "build_artifacts" in globals():
         result["artifacts"] = build_artifacts(job, result)
     if "get_primary_score" in globals():
@@ -879,6 +885,347 @@ def build_simulated_result_metrics(job: models.TrainingJob):
     return metrics, epoch_metrics
 
 
+def save_stringit_results_plot(
+    job: models.TrainingJob,
+    epoch_metrics: List[Dict[str, Any]],
+    run_dir: Optional[str],
+    theme: str = "dark",
+):
+    if not run_dir or not epoch_metrics:
+        return ""
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return ""
+
+    run_path = Path(run_dir)
+    run_path.mkdir(parents=True, exist_ok=True)
+    is_light = theme == "light"
+    output_path = run_path / ("results_light.png" if is_light else "results_stringit.png")
+    marker_path = run_path / f".{output_path.stem}.cache"
+    cache_signature = json.dumps(
+        {
+            "version": RESULTS_PLOT_STYLE_VERSION,
+            "theme": theme,
+            "epoch_count": len(epoch_metrics),
+            "last_epoch": epoch_metrics[-1] if epoch_metrics else {},
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    if output_path.exists() and marker_path.exists():
+        try:
+            if marker_path.read_text(encoding="utf-8") == cache_signature:
+                return str(output_path)
+        except OSError:
+            pass
+
+    def font(size: int, bold: bool = False):
+        font_names = ["segoeuib.ttf", "arialbd.ttf"] if bold else ["segoeui.ttf", "arial.ttf"]
+        for name in font_names:
+            try:
+                return ImageFont.truetype(str(Path("C:/Windows/Fonts") / name), size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    def hex_to_rgb(color: str):
+        color = color.lstrip("#")
+        return tuple(int(color[i : i + 2], 16) for i in (0, 2, 4))
+
+    def blend(color: str, amount: float, base=(3, 3, 3)):
+        rgb = hex_to_rgb(color)
+        return tuple(int(base[index] * (1 - amount) + rgb[index] * amount) for index in range(3))
+
+    def metric_values(*keys: str):
+        values = []
+        for row in epoch_metrics:
+            value = first_metric_value(row, *keys)
+            if value is not None:
+                values.append(value)
+        return values
+
+    if job.task_type == "classify":
+        series_slots = [
+            ("Train Acc", "#8677fc" if is_light else "#8b83ff", ("train_acc",)),
+            ("Val Acc", "#b3abf1" if is_light else "#f5f5ef", ("val_acc", "accuracy_top1")),
+            ("Train Loss", "#b3abf1" if is_light else "#77777a", ("train_loss",)),
+            ("Val Loss", "#b3abf1" if is_light else "#b6b6b0", ("val_loss",)),
+        ]
+    else:
+        series_slots = [
+            ("mAP50-95", "#7b6cf6" if is_light else "#6f68d8", ("map50_95",)),
+            ("mAP50", "#8677fc" if is_light else "#8b83ff", ("map50",)),
+            ("Precision", "#b3abf1" if is_light else "#f5f5ef", ("precision",)),
+            ("Recall", "#b3abf1" if is_light else "#b6b6b0", ("recall",)),
+        ]
+
+    series = [
+        (label, color, metric_values(*keys))
+        for label, color, keys in series_slots
+    ]
+
+    if not any(values for _, _, values in series):
+        return ""
+
+    palette = {
+        "bg": "#fbfaff" if is_light else "#030303",
+        "dot": "#ece8ff" if is_light else "#151515",
+        "texture": "#f1eefc" if is_light else "#0f0f0f",
+        "title": "#212121" if is_light else "#f5f5ef",
+        "muted": "#8f8ca3" if is_light else "#77777a",
+        "rule": "#e5e0f5" if is_light else "#242424",
+        "card": "#ffffff" if is_light else "#070707",
+        "card_header": "#fbfaff" if is_light else "#0b0b0b",
+        "card_border": "#e5e0f5" if is_light else "#242424",
+        "grid_h": "#e9e5f6" if is_light else "#252525",
+        "grid_v": "#f0edf8" if is_light else "#1d1d1d",
+        "axis": "#9a96aa" if is_light else "#5e5e5e",
+        "point": "#ffffff" if is_light else "#f5f5ef",
+        "point_outline": "#212121" if is_light else "#030303",
+        "empty": "#9a96aa" if is_light else "#77777a",
+        "base_rgb": (255, 255, 255) if is_light else (3, 3, 3),
+        "bar_amount": 0.3 if is_light else 0.48,
+        "line_shadow": 0.16 if is_light else 0.28,
+    }
+
+    width, height = 1500, 860
+    image = Image.new("RGB", (width, height), palette["bg"])
+    draw = ImageDraw.Draw(image)
+
+    # Subtle technical texture.
+    for x in range(0, width, 12):
+        for y in range(0, height, 12):
+            if (x + y) % 36 == 0:
+                draw.point((x, y), fill=palette["dot"])
+    for x in range(0, width, 36):
+        draw.line((x, 0, x, height), fill=palette["texture"])
+    for y in range(0, height, 36):
+        draw.line((0, y, width, y), fill=palette["texture"])
+
+    title_font = font(44, True)
+    meta_font = font(20)
+    label_font = font(24, True)
+    small_font = font(17)
+
+    draw.text((48, 42), "RESULTS PLOT", fill=palette["title"], font=title_font)
+    draw.text((50, 96), f"{job.name}  /  {job.task_type.upper()}  /  {max(1, int(job.epochs or len(epoch_metrics)))} EPOCHS", fill=palette["muted"], font=meta_font)
+    draw.line((48, 138, width - 48, 138), fill=palette["rule"], width=1)
+
+    columns = 2
+    rows = 2
+    gap = 22
+    left = 48
+    top = 174
+    card_w = int((width - left * 2 - gap * (columns - 1)) / columns)
+    card_h = int((height - top - 46 - gap * (rows - 1)) / rows)
+
+    def draw_card(index: int, label: str, color: str, values: List[float]):
+        col = index % columns
+        row = index // columns
+        x0 = left + col * (card_w + gap)
+        y0 = top + row * (card_h + gap)
+        x1 = x0 + card_w
+        y1 = y0 + card_h
+
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=6, fill=palette["card"], outline=palette["card_border"], width=1)
+        draw.rectangle((x0 + 1, y0 + 1, x1 - 1, y0 + 36), fill=palette["card_header"])
+        draw.text((x0 + 18, y0 + 16), label, fill=palette["title"], font=label_font)
+
+        plot_left = x0 + 22
+        plot_top = y0 + 66
+        plot_right = x1 - 22
+        plot_bottom = y1 - 26
+        plot_w = plot_right - plot_left
+        plot_h = plot_bottom - plot_top
+
+        for step in range(5):
+            gy = plot_top + (plot_h / 4) * step
+            gx = plot_left + (plot_w / 4) * step
+            draw.line((plot_left, gy, plot_right, gy), fill=palette["grid_h"], width=1)
+            draw.line((gx, plot_top, gx, plot_bottom), fill=palette["grid_v"], width=1)
+
+        if not values:
+            mid_y = plot_top + plot_h / 2
+            draw.line((plot_left, mid_y, plot_right, mid_y), fill=blend(color, palette["line_shadow"], palette["base_rgb"]), width=3)
+            empty_text = "No Data"
+            empty_w = draw.textlength(empty_text, font=label_font)
+            draw.text(
+                (plot_left + (plot_w - empty_w) / 2, plot_top + (plot_h - 24) / 2),
+                empty_text,
+                fill=palette["empty"],
+                font=label_font,
+            )
+            draw.text((plot_left, plot_bottom + 7), "epoch 1", fill=palette["axis"], font=small_font)
+            end_label = f"epoch {len(epoch_metrics)}"
+            end_w = draw.textlength(end_label, font=small_font)
+            draw.text((plot_right - end_w, plot_bottom + 7), end_label, fill=palette["axis"], font=small_font)
+            return
+
+        last_value = values[-1]
+        value_text = f"{last_value:.4f}" if "loss" in label.lower() else f"{last_value * 100:.1f}%"
+        value_w = draw.textlength(value_text, font=label_font)
+        draw.text((x1 - 18 - value_w, y0 + 16), value_text, fill=color, font=label_font)
+
+        min_value = min(values)
+        max_value = max(values)
+        if max_value == min_value:
+            max_value += 1
+            min_value -= 1
+        value_range = max_value - min_value
+
+        points = []
+        for point_index, value in enumerate(values):
+            ratio = point_index / max(1, len(values) - 1)
+            x = plot_left + ratio * plot_w
+            y = plot_bottom - ((value - min_value) / value_range) * plot_h
+            points.append((x, y))
+
+        if len(points) > 1:
+            draw.line(points, fill=blend(color, palette["line_shadow"], palette["base_rgb"]), width=8, joint="curve")
+            draw.line(points, fill=color, width=3, joint="curve")
+        for x, y in points:
+            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=palette["point"], outline=palette["point_outline"], width=2)
+
+        draw.text((plot_left, plot_bottom + 7), "epoch 1", fill=palette["axis"], font=small_font)
+        end_label = f"epoch {len(values)}"
+        end_w = draw.textlength(end_label, font=small_font)
+        draw.text((plot_right - end_w, plot_bottom + 7), end_label, fill=palette["axis"], font=small_font)
+
+    for index, (label, color, values) in enumerate(series):
+        draw_card(index, label, color, values)
+
+    image.save(output_path, quality=95)
+    try:
+        marker_path.write_text(cache_signature, encoding="utf-8")
+    except OSError:
+        pass
+    return str(output_path)
+
+
+def ensure_stringit_results_plot(job: models.TrainingJob, result: Dict[str, Any], epoch_metrics: List[Dict[str, Any]]):
+    run_dir = result.get("run_dir") or job.run_dir
+    dark_path = save_stringit_results_plot(job, epoch_metrics, run_dir, theme="dark")
+    save_stringit_results_plot(job, epoch_metrics, run_dir, theme="light")
+    return dark_path
+
+
+def save_stringit_confusion_matrix(run_dir: Optional[str], theme: str = "dark"):
+    if not run_dir:
+        return ""
+
+    try:
+        from PIL import Image
+    except Exception:
+        return ""
+
+    run_path = Path(run_dir)
+    source_path = None
+    for root in [run_path, run_path / "ultralytics"]:
+        for name in ["confusion_matrix.png", "confusion_matrix_normalized.png"]:
+            candidate = root / name
+            if candidate.exists():
+                source_path = candidate
+                break
+        if source_path:
+            break
+    if not source_path:
+        return ""
+
+    is_light = theme == "light"
+    output_path = source_path.parent / ("confusion_matrix_light.png" if is_light else "confusion_matrix_stringit.png")
+    marker_path = source_path.parent / f".{output_path.stem}.cache"
+    try:
+        source_stat = source_path.stat()
+        cache_signature = json.dumps(
+            {
+                "version": CONFUSION_MATRIX_STYLE_VERSION,
+                "theme": theme,
+                "source_name": source_path.name,
+                "source_size": source_stat.st_size,
+                "source_mtime_ns": source_stat.st_mtime_ns,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    except OSError:
+        return ""
+    if output_path.exists() and marker_path.exists():
+        try:
+            if marker_path.read_text(encoding="utf-8") == cache_signature:
+                return str(output_path)
+        except OSError:
+            pass
+
+    def mix(start, end, amount: float):
+        amount = max(0.0, min(1.0, amount))
+        return tuple(int(start[index] * (1 - amount) + end[index] * amount) for index in range(3))
+
+    try:
+        image = Image.open(source_path).convert("RGB")
+    except Exception:
+        return ""
+
+    width, height = image.size
+    source = image.load()
+    styled = Image.new("RGB", (width, height), "#fbfaff" if is_light else "#030303")
+    target = styled.load()
+    if is_light:
+        background = (251, 250, 255)
+        panel = (246, 243, 255)
+        grid = (226, 221, 243)
+        text = (33, 33, 33)
+        muted = (132, 127, 154)
+        accent = (134, 119, 252)
+    else:
+        background = (3, 3, 3)
+        panel = (8, 8, 9)
+        grid = (38, 38, 38)
+        text = (245, 245, 239)
+        muted = (120, 120, 120)
+        accent = (139, 131, 255)
+
+    for y in range(height):
+        for x in range(width):
+            r, g, b = source[x, y]
+            lum = (0.299 * r) + (0.587 * g) + (0.114 * b)
+            max_channel = max(r, g, b)
+            min_channel = min(r, g, b)
+            saturation = max_channel - min_channel
+            blue_bias = b - max(r, g)
+
+            if saturation > 24 and (blue_bias > 8 or b > 120):
+                heat = max(saturation / 255, (255 - lum) / 255)
+                amount = 0.2 + heat * (0.66 if is_light else 0.72)
+                target[x, y] = mix(panel, accent, amount)
+            elif lum < 76:
+                intensity = 1 - (lum / 76)
+                target[x, y] = mix(muted, text, intensity)
+            elif lum > 238:
+                target[x, y] = background
+            elif lum > 196:
+                target[x, y] = mix(background, grid, (255 - lum) / 59)
+            else:
+                intensity = (196 - lum) / 120
+                target[x, y] = mix(grid, text, intensity * 0.72)
+
+    styled.save(output_path, quality=95)
+    try:
+        marker_path.write_text(cache_signature, encoding="utf-8")
+    except OSError:
+        pass
+    return str(output_path)
+
+
+def ensure_stringit_confusion_matrix(job: models.TrainingJob, result: Dict[str, Any]):
+    run_dir = result.get("run_dir") or job.run_dir
+    dark_path = save_stringit_confusion_matrix(run_dir, theme="dark")
+    save_stringit_confusion_matrix(run_dir, theme="light")
+    return dark_path
+
+
 def ensure_result_metrics(job: models.TrainingJob, result: Dict[str, Any]):
     metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
     epoch_metrics = result.get("epoch_metrics") if isinstance(result.get("epoch_metrics"), list) else []
@@ -915,7 +1262,9 @@ def build_artifacts(job: models.TrainingJob, result: Dict[str, Any]):
         "last_model_path": result.get("last_model_path", ""),
         "results_csv": "",
         "confusion_matrix": "",
+        "confusion_matrix_light": "",
         "results_plot": "",
+        "results_plot_light": "",
         "labels": "",
         "train_batch": "",
         "val_batch": "",
@@ -939,8 +1288,16 @@ def build_artifacts(job: models.TrainingJob, result: Dict[str, Any]):
     if run_dir:
         run_path = Path(run_dir)
         artifacts["results_csv"] = pick_first(run_path, ["results.csv"])
-        artifacts["confusion_matrix"] = pick_first(run_path, ["confusion_matrix.png", "confusion_matrix_normalized.png"])
-        artifacts["results_plot"] = pick_first(run_path, ["results.png"])
+        artifacts["confusion_matrix"] = pick_first(
+            run_path,
+            ["confusion_matrix_stringit.png", "confusion_matrix.png", "confusion_matrix_normalized.png"],
+        )
+        artifacts["confusion_matrix_light"] = pick_first(
+            run_path,
+            ["confusion_matrix_light.png", "confusion_matrix.png", "confusion_matrix_normalized.png"],
+        )
+        artifacts["results_plot"] = pick_first(run_path, ["results_stringit.png", "results.png"])
+        artifacts["results_plot_light"] = pick_first(run_path, ["results_light.png", "results.png"])
         artifacts["labels"] = pick_first(run_path, ["labels.jpg", "labels_correlogram.jpg"])
         artifacts["train_batch"] = pick_glob(run_path, ["train_batch*.jpg", "train_batch*.png"])
         artifacts["val_batch"] = pick_glob(run_path, ["val_batch*.jpg", "val_batch*.png"])
@@ -967,6 +1324,8 @@ def serialize_result_run(
 ):
     result = read_json_dict(job.result_json)
     metrics, epoch_metrics = ensure_result_metrics(job, result)
+    ensure_stringit_results_plot(job, result, epoch_metrics)
+    ensure_stringit_confusion_matrix(job, result)
     artifacts = build_artifacts(job, result)
     primary_score = get_primary_score(job, metrics)
     payload = serialize_training_job(job, dataset, pipeline)

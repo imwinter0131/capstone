@@ -3,6 +3,7 @@ import Login from "./Login";
 import DatasetManage from "./DatasetManage";
 import Projects from "./Projects";
 import TrainingManage from "./TrainingManage";
+import ThemeToggle from "./ThemeToggle";
 
 function getStoredUser() {
   try {
@@ -32,34 +33,39 @@ function App() {
     };
   }, []);
 
+  let page;
+
   if (path === "/projects") {
     if (!user?.user_id) {
-      return <Login />;
+      page = <Login />;
+    } else {
+      page = <Projects user={user} />;
     }
-
-    return <Projects user={user} />;
-  }
-
-  if (path.startsWith("/projects/")) {
+  } else if (path.startsWith("/projects/")) {
     if (!user?.user_id) {
-      return <Login />;
+      page = <Login />;
+    } else {
+      const pathParts = path.split("/").filter(Boolean);
+      const projectId = pathParts[1];
+
+      if (pathParts[2] === "preprocessing") {
+        page = <DatasetManage user={user} projectId={projectId} />;
+      } else if (pathParts[2] === "training") {
+        page = <TrainingManage user={user} projectId={projectId} />;
+      } else {
+        page = <DatasetManage user={user} projectId={projectId} />;
+      }
     }
-
-    const pathParts = path.split("/").filter(Boolean);
-    const projectId = pathParts[1];
-
-    if (pathParts[2] === "preprocessing") {
-      return <DatasetManage user={user} projectId={projectId} />;
-    }
-
-    if (pathParts[2] === "training") {
-      return <TrainingManage user={user} projectId={projectId} />;
-    }
-
-    return <DatasetManage user={user} projectId={projectId} />;
+  } else {
+    page = <Login />;
   }
 
-  return <Login />;
+  return (
+    <>
+      <ThemeToggle />
+      {page}
+    </>
+  );
 }
 
 export default App;

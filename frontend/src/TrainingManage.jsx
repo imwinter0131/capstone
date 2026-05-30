@@ -191,6 +191,27 @@ function artifactImageUrl(projectId, userId, path) {
   return `${API_BASE}/projects/${projectId}/artifact-file?user_id=${userId}&path=${encodeURIComponent(path)}`;
 }
 
+function getCurrentTheme() {
+  if (typeof document === "undefined") return "dark";
+  return document.documentElement.dataset.theme === "light" ? "light" : "dark";
+}
+
+function useThemeMode() {
+  const [themeMode, setThemeMode] = useState(getCurrentTheme);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return undefined;
+    const root = document.documentElement;
+    const updateTheme = () => setThemeMode(getCurrentTheme());
+    const observer = new MutationObserver(updateTheme);
+    observer.observe(root, { attributes: true, attributeFilter: ["data-theme"] });
+    updateTheme();
+    return () => observer.disconnect();
+  }, []);
+
+  return themeMode;
+}
+
 function getMetricValue(metrics, key) {
   if (key === "val_acc") return metrics.val_acc ?? metrics.accuracy_top1;
   return metrics[key];
@@ -221,13 +242,14 @@ function TrainingMiniChart({ job }) {
   const rows = job?.result?.epoch_metrics || [];
   const primaryMetricKey = getPrimaryMetricKey(job);
   const lines = [
-    { key: "train_loss", className: "line-loss" },
-    { key: "val_loss", className: "line-val" },
-    { key: primaryMetricKey, className: "line-score" },
+    { key: "train_loss", className: "line-loss", label: "Train Loss" },
+    { key: "val_loss", className: "line-val", label: "Val Loss" },
+    { key: primaryMetricKey, className: "line-score", label: metricLabels[primaryMetricKey] || "Score" },
   ];
   const width = 420;
-  const height = 160;
-  const padding = 18;
+  const height = 190;
+  const padding = 24;
+  const gridCount = 5;
   const values = rows.flatMap((row) => lines.map((line) => Number(row[line.key])).filter((value) => Number.isFinite(value)));
 
   if (!rows.length || values.length === 0) {
@@ -243,29 +265,62 @@ function TrainingMiniChart({ job }) {
     if (!Number.isFinite(value)) return null;
     const x = padding + (rows.length === 1 ? 0 : (index / (rows.length - 1)) * (width - padding * 2));
     const y = padding + (height - padding * 2) - ((value - minValue) / range) * (height - padding * 2);
-    return `${x.toFixed(2)},${y.toFixed(2)}`;
+    return {
+      x,
+      y,
+      label: `${x.toFixed(2)},${y.toFixed(2)}`,
+    };
   }
 
   return (
     <div className="live-chart">
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="training live metric chart">
-        <line x1={padding} y1={padding} x2={padding} y2={height - padding} />
-        <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} />
+        {Array.from({ length: gridCount }).map((_, index) => {
+          const ratio = index / (gridCount - 1);
+          const y = padding + ratio * (height - padding * 2);
+          const x = padding + ratio * (width - padding * 2);
+
+          return (
+            <React.Fragment key={index}>
+              <line className="chart-grid" x1={padding} y1={y} x2={width - padding} y2={y} />
+              <line className="chart-grid" x1={x} y1={padding} x2={x} y2={height - padding} />
+            </React.Fragment>
+          );
+        })}
+        <line className="chart-axis" x1={padding} y1={padding} x2={padding} y2={height - padding} />
+        <line className="chart-axis" x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} />
+        <text className="chart-label" x={padding} y={15}>
+          {maxValue < 1 ? maxValue.toFixed(3) : maxValue.toFixed(1)}
+        </text>
+        <text className="chart-label" x={padding} y={height - 6}>
+          epoch {rows.length}
+        </text>
         {lines.map((line) => {
-          const points = rows.map((row, index) => point(row, index, line.key)).filter(Boolean).join(" ");
-          return <polyline key={line.key} points={points} className={line.className} />;
+          const chartPoints = rows.map((row, index) => point(row, index, line.key)).filter(Boolean);
+          const points = chartPoints.map((item) => item.label).join(" ");
+          const lastPoint = chartPoints[chartPoints.length - 1];
+
+          if (!points) return null;
+
+          return (
+            <React.Fragment key={line.key}>
+              <polyline points={points} className={line.className} />
+              {lastPoint && <circle className={`chart-point ${line.className}`} cx={lastPoint.x} cy={lastPoint.y} r="3.8" />}
+            </React.Fragment>
+          );
         })}
       </svg>
       <div className="live-chart-legend">
-        <span><i className="line-loss" />Train Loss</span>
-        <span><i className="line-val" />Val Loss</span>
-        <span><i className="line-score" />{metricLabels[primaryMetricKey] || "Score"}</span>
+        {lines.map((line) => (
+          <span key={line.key}><i className={line.className} />{line.label}</span>
+        ))}
       </div>
     </div>
   );
 }
 
 function TrainingManage({ user, projectId }) {
+  const themeMode = useThemeMode();
   const [project, setProject] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [datasets, setDatasets] = useState([]);
@@ -325,12 +380,15 @@ function TrainingManage({ user, projectId }) {
   const selectedBestDelta =
     selectedPrimaryScore !== null && bestPrimaryScore !== null ? selectedPrimaryScore - bestPrimaryScore : null;
   const previewArtifacts = previewArtifactKeys
-    .map((key) => ({
-      key,
-      label: artifactItems.find((item) => item.key === key)?.label || key,
-      path: selectedArtifacts?.[key] || "",
-      exists: selectedArtifacts?.exists?.[key],
-    }))
+    .map((key) => {
+      const lightKey = themeMode === "light" && ["results_plot", "confusion_matrix"].includes(key) ? `${key}_light` : key;
+      return {
+        key,
+        label: artifactItems.find((item) => item.key === key)?.label || key,
+        path: selectedArtifacts?.[lightKey] || selectedArtifacts?.[key] || "",
+        exists: selectedArtifacts?.exists?.[lightKey] ?? selectedArtifacts?.exists?.[key],
+      };
+    })
     .filter((item) => item.path && item.exists !== false);
 
   useEffect(() => {
@@ -908,15 +966,6 @@ function TrainingManage({ user, projectId }) {
                   <span>{selectedJob ? `${selectedJob.task_type === "detect" ? "Detection" : "Classification"} · ${selectedJob.yolo_model}` : "학습 작업을 선택하세요."}</span>
                 </div>
                 {selectedJob && <span className={`status-pill status-${selectedJob.status.toLowerCase()}`}>{selectedJob.status}</span>}
-              </div>
-
-              <div className="live-controls">
-                <button type="button" onClick={() => loadPage(true)}>
-                  Refresh
-                </button>
-                <button type="button" className="tune-action" onClick={() => openRetuneModal(selectedJob)} disabled={!selectedJob}>
-                  Retune from Result
-                </button>
               </div>
 
               {selectedJob ? (

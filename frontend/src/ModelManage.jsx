@@ -108,11 +108,11 @@ function ModelManage() {
   };
 
   return (
-    <div style={{ minHeight: "100vh", background: "#fff", color: "#111", padding: "24px", fontFamily: "sans-serif" }}>
+    <div className="model-registry-page">
       <h1>모델 관리</h1>
       <p>배포용 AI 모델을 등록하고 메타데이터, 배포 상태, 런타임 적용을 관리합니다.</p>
 
-      <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "16px", marginBottom: "16px" }}>
+      <section className="model-registry-section">
         <h2>배포용 AI 모델 등록 및 메타데이터 중앙관리</h2>
         <input type="file" onChange={(e) => setFile(e.target.files[0])} />
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="모델 이름" />
@@ -130,10 +130,10 @@ function ModelManage() {
           <option value="Custom">Custom</option>
         </select>
         <textarea value={description} onChange={(e) => setDescription(e.target.value)} placeholder="모델 설명" />
-        <button onClick={saveModel} disabled={loading}>모델 등록</button>
+        <button className="primary-action" onClick={saveModel} disabled={loading}>모델 등록</button>
       </section>
 
-      <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "16px" }}>
+      <section className="model-registry-section">
         <h2>모델 목록 통합 조회 및 조건부 탐색</h2>
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="이름, 버전, 설명 검색" />
         <select value={status} onChange={(e) => setStatus(e.target.value)}>
@@ -155,7 +155,7 @@ function ModelManage() {
         </select>
         <button onClick={loadModels}>검색</button>
 
-        <div style={{ marginTop: "12px" }}>
+        <div className="model-runtime-row">
           <span>배포 대상 </span>
           <select value={runtimeTarget} onChange={(e) => setRuntimeTarget(e.target.value)}>
             <option value="local-runtime">local-runtime</option>
@@ -165,11 +165,11 @@ function ModelManage() {
           </select>
         </div>
 
-        {error && <div style={{ color: "red" }}>{error}</div>}
+        {error && <div className="model-registry-error">{error}</div>}
         {loading && <div>처리 중...</div>}
 
         {models.map((item) => (
-          <div key={item.id} style={{ border: "1px solid #ddd", padding: "12px", marginTop: "10px" }}>
+          <div key={item.id} className="model-registry-card">
             <h3>{item.name} {item.version}</h3>
             <div>작업 유형: {item.task}</div>
             <div>프레임워크: {item.framework}</div>
